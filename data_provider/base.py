@@ -2756,6 +2756,7 @@ class DataFetcherManager:
             "capital_flow",
             "dragon_tiger",
             "boards",
+            "structural_risk",
         ):
             payload = context.get(block, {})
             if isinstance(payload, dict) and DataFetcherManager._has_meaningful_payload(payload.get("data")):
@@ -2801,6 +2802,12 @@ class DataFetcherManager:
                 [reason],
             ),
             "boards": self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                [reason],
+            ),
+            "structural_risk": self._build_fundamental_block(
                 "not_supported",
                 {},
                 [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
@@ -2868,6 +2875,7 @@ class DataFetcherManager:
             "capital_flow": {},
             "dragon_tiger": {},
             "boards": {},
+            "structural_risk": {},
             "belong_boards": [],
             "coverage": {},
             "source_chain": [],
@@ -2953,8 +2961,8 @@ class DataFetcherManager:
             list(adapter_errors),
         )
 
-        # capital_flow / dragon_tiger / boards: no offshore data feed today -> not_supported.
-        for block in ("capital_flow", "dragon_tiger", "boards"):
+        # capital_flow / dragon_tiger / boards / structural_risk: no offshore data feed today -> not_supported.
+        for block in ("capital_flow", "dragon_tiger", "boards", "structural_risk"):
             result_ctx[block] = self._build_fundamental_block(
                 "not_supported",
                 {},
@@ -3041,9 +3049,10 @@ class DataFetcherManager:
             "capital_flow": "not_supported",
             "dragon_tiger": "not_supported",
             "boards": "not_supported",
+            "structural_risk": "not_supported",
         }
         result_ctx["coverage"] = block_statuses
-        for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards"):
+        for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards", "structural_risk"):
             result_ctx["errors"].extend(result_ctx[block].get("errors", []))
             result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
 
@@ -3164,6 +3173,7 @@ class DataFetcherManager:
             "capital_flow": {},
             "dragon_tiger": {},
             "boards": {},
+            "structural_risk": {},
             "coverage": {},
             "source_chain": [],
             "errors": [],
@@ -3209,6 +3219,39 @@ class DataFetcherManager:
             ),
             [valuation_err] if valuation_err else [],
         )
+
+        # 估值参照数据（历史分位 / 行业对比），additive 合并进 valuation 块
+        if not is_etf and remaining_seconds > 0:
+            profile_timeout = min(fetch_timeout, remaining_seconds)
+            profile_payload, profile_err, profile_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_valuation_profile(stock_code),
+                profile_timeout,
+                "fundamental_valuation_profile",
+            )
+            _consume_budget(profile_ms)
+            valuation_block = result_ctx["valuation"]
+            if isinstance(profile_payload, dict) and isinstance(profile_payload.get("profile"), dict) and profile_payload["profile"]:
+                valuation_block["data"].update(profile_payload["profile"])
+                valuation_block["source_chain"] = list(valuation_block.get("source_chain", [])) + self._normalize_source_chain(
+                    profile_payload.get("source_chain"),
+                    "valuation_profile",
+                    "ok",
+                    profile_ms,
+                )
+                valuation_block["errors"] = list(valuation_block.get("errors", [])) + [
+                    str(item) for item in (profile_payload.get("errors") or [])
+                ]
+                refreshed_status = self._infer_block_status(valuation_block.get("data"), valuation_block.get("status", "partial"))
+                valuation_block["status"] = refreshed_status
+                valuation_block["coverage"] = {"status": refreshed_status}
+            else:
+                diagnostic_errors: List[str] = []
+                if isinstance(profile_payload, dict):
+                    diagnostic_errors.extend(str(item) for item in (profile_payload.get("errors") or []))
+                if profile_err:
+                    diagnostic_errors.append(profile_err)
+                if diagnostic_errors:
+                    valuation_block["errors"] = list(valuation_block.get("errors", [])) + diagnostic_errors
 
         # growth / earnings / institution (one AkShare call)
         if remaining_seconds <= 0:
@@ -3345,6 +3388,12 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
                 ["etf not fully supported"],
             )
+            result_ctx["structural_risk"] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["etf not fully supported"],
+            )
             result_ctx["status"] = "partial"
         else:
             capital_flow_budget = min(fetch_timeout, remaining_seconds)
@@ -3363,7 +3412,14 @@ class DataFetcherManager:
             )
             _consume_budget(int((time.time() - dragon_tiger_start) * 1000))
 
+            board_start = time.time()
             result_ctx["boards"] = self.get_board_context(
+                stock_code,
+                budget_seconds=min(fetch_timeout, remaining_seconds),
+            )
+            _consume_budget(int((time.time() - board_start) * 1000))
+
+            result_ctx["structural_risk"] = self.get_structural_risk_context(
                 stock_code,
                 budget_seconds=min(fetch_timeout, remaining_seconds),
             )
@@ -3376,6 +3432,7 @@ class DataFetcherManager:
             "capital_flow": result_ctx["capital_flow"].get("status", "not_supported"),
             "dragon_tiger": result_ctx["dragon_tiger"].get("status", "not_supported"),
             "boards": result_ctx["boards"].get("status", "not_supported"),
+            "structural_risk": result_ctx["structural_risk"].get("status", "not_supported"),
         }
         result_ctx["coverage"] = block_statuses
         for block in (
@@ -3386,6 +3443,7 @@ class DataFetcherManager:
             "capital_flow",
             "dragon_tiger",
             "boards",
+            "structural_risk",
         ):
             result_ctx["errors"].extend(result_ctx[block].get("errors", []))
             result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
@@ -3471,6 +3529,65 @@ class DataFetcherManager:
                 payload.get("source_chain", []),
                 "capital_flow",
                 capital_flow_status,
+                cost_ms,
+            ),
+            list(payload.get("errors", [])) + ([err] if err else []),
+        )
+
+    def get_structural_risk_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """结构性风险块：解禁/质押/两融（fail-open，仅 A 股非 ETF）。"""
+        from src.config import get_config
+
+        config = get_config()
+        stock_code = normalize_stock_code(stock_code)
+        timeout = float(budget_seconds if budget_seconds is not None else config.fundamental_fetch_timeout_seconds)
+        if _market_tag(stock_code) != "cn" or _is_etf_code(stock_code):
+            return self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported"],
+            )
+
+        if timeout <= 0:
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
+                ["fundamental stage timeout"],
+            )
+        payload, err, cost_ms = self._run_with_retry(
+            lambda: self._fundamental_adapter.get_structural_risk(stock_code),
+            timeout,
+            "structural_risk",
+        )
+        if not isinstance(payload, dict):
+            return self._build_fundamental_block(
+                "failed",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
+                [err or "structural_risk failed"],
+            )
+
+        data_payload = {
+            "restricted_release": payload.get("restricted_release", {}),
+            "pledge": payload.get("pledge", {}),
+            "margin": payload.get("margin", {}),
+        }
+        adapter_status = str(payload.get("status", "not_supported"))
+        if self._has_meaningful_payload(data_payload):
+            structural_status = "ok"
+        elif adapter_status == "not_supported":
+            structural_status = "not_supported"
+        else:
+            structural_status = "partial"
+        return self._build_fundamental_block(
+            structural_status,
+            data_payload,
+            self._normalize_source_chain(
+                payload.get("source_chain", []),
+                "structural_risk",
+                structural_status,
                 cost_ms,
             ),
             list(payload.get("errors", [])) + ([err] if err else []),

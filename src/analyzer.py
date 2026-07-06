@@ -2063,7 +2063,8 @@ class GeminiAnalyzer:
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
-- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。
+- 估值高低判断必须引用输入中的“估值参照”数据（PE/PB 历史分位、行业中位数）；该数据缺失时，禁止输出“估值合理/偏低/偏高”类结论，涉及估值的检查项按“数据缺失”处理。"""
 
     SYSTEM_PROMPT = """你是一位{market_placeholder}投资分析师，负责生成专业的【决策仪表盘】分析报告。
 
@@ -2249,7 +2250,8 @@ class GeminiAnalyzer:
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
 - 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
-- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。
+- 估值高低判断必须引用输入中的“估值参照”数据（PE/PB 历史分位、行业中位数）；该数据缺失时，禁止输出“估值合理/偏低/偏高”类结论，涉及估值的检查项按“数据缺失”处理。"""
 
     TEXT_SYSTEM_PROMPT = """你是一位专业的股票分析助手。
 
@@ -3807,6 +3809,22 @@ class GeminiAnalyzer:
         if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
+            growth_block = (
+                fundamental_context.get("growth", {})
+                if isinstance(fundamental_context, dict)
+                else {}
+            )
+            growth_data = (
+                growth_block.get("data", {})
+                if isinstance(growth_block, dict)
+                else {}
+            )
+            if not isinstance(growth_data, dict):
+                growth_data = {}
+
+            def _cell(value: Any) -> Any:
+                return "N/A" if value is None else value
+
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
             ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
             ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
@@ -3817,14 +3835,78 @@ class GeminiAnalyzer:
 |------|------|------|
 | 最近报告期 | {report_date} | 来自结构化财报字段 |
 | 营业收入 | {financial_report.get('revenue', 'N/A')} | |
+| 营收同比 | {_cell(growth_data.get('revenue_yoy'))} | |
 | 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
+| 归母净利同比 | {_cell(growth_data.get('net_profit_yoy'))} | 与营收同比背离过大时注意利润质量 |
 | 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
+| 净现比 | {_cell(financial_report.get('ocf_to_net_profit_ratio'))} | 经营现金流/归母净利润；单期值明显小于1提示利润未充分转化为现金，仅为单期口径 |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
 | TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
 | TTM 分红事件数 | {ttm_count} | |
 
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
+"""
+
+        # 估值参照（历史分位 + 行业对比）——只对 A 股个股渲染，作为估值结论的唯一依据
+        is_cn_equity = detect_market(code) == "cn" and not context.get("is_index_etf")
+        if is_cn_equity:
+            valuation_block = (
+                fundamental_context.get("valuation", {})
+                if isinstance(fundamental_context, dict)
+                else {}
+            )
+            valuation_data = (
+                valuation_block.get("data", {})
+                if isinstance(valuation_block, dict)
+                else {}
+            )
+            if not isinstance(valuation_data, dict):
+                valuation_data = {}
+
+            def _pct_cell(value: Any) -> str:
+                if isinstance(value, (int, float)):
+                    return f"{value:.1f}%"
+                return "N/A"
+
+            def _num_cell(value: Any) -> Any:
+                return "N/A" if value is None else value
+
+            _valuation_profile_keys = (
+                "pe_percentile_3y",
+                "pe_percentile_5y",
+                "pb_percentile_3y",
+                "pb_percentile_5y",
+                "industry_pe_median",
+                "industry_pb_median",
+            )
+            has_valuation_profile = any(
+                valuation_data.get(key) is not None for key in _valuation_profile_keys
+            )
+            if has_valuation_profile:
+                industry_sample = valuation_data.get("industry_pe_sample_count")
+                industry_sample_text = f"，样本 {industry_sample} 只" if industry_sample else ""
+                prompt += f"""
+### 估值参照（历史分位与行业对比）
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| PE(TTM) | {_num_cell(valuation_data.get('pe_ttm'))} | 历史序列截至 {valuation_data.get('history_as_of') or 'N/A'} |
+| PE 3年分位 | {_pct_cell(valuation_data.get('pe_percentile_3y'))} | 分位低于30%属历史偏低区、高于70%属历史偏高区，仅为统计参照 |
+| PE 5年分位 | {_pct_cell(valuation_data.get('pe_percentile_5y'))} | |
+| PB | {_num_cell(valuation_data.get('pb'))} | |
+| PB 3年分位 | {_pct_cell(valuation_data.get('pb_percentile_3y'))} | |
+| PB 5年分位 | {_pct_cell(valuation_data.get('pb_percentile_5y'))} | |
+| 所属行业 | {valuation_data.get('industry_name') or 'N/A'} | 东方财富行业分类 |
+| 行业PE中位数 | {_num_cell(valuation_data.get('industry_pe_median'))} | 动态市盈率口径、剔除亏损股{industry_sample_text}；与个股 PE(TTM) 口径不同，仅作粗略对比 |
+| 行业PB中位数 | {_num_cell(valuation_data.get('industry_pb_median'))} | |
+
+> 估值高低判断必须引用上表的分位或行业对比数据；分位偏低不等于买入依据，需结合盈利趋势解读；上表未提供的口径不得自行补充。
+"""
+            else:
+                prompt += """
+### 估值参照（历史分位与行业对比）
+> 本次未获取到估值参照数据（PE/PB 历史分位、行业中位数）。
+> 严禁凭经验或训练记忆给出“估值合理/偏低/偏高”的结论；涉及估值的检查项一律按“数据缺失”处理（标 ⚠️），`risk_alerts` 与 `buy_reason` 中也不得出现无数据依据的估值判断。
 """
 
         capital_flow_block = (
@@ -3878,6 +3960,84 @@ class GeminiAnalyzer:
 | 资金流出靠前板块 | {bottom_sector_text} | 板块风险参考 |
 
 > 资金流向只能作为价格位置的过滤器：接近压力且主力流出时不得追买；接近支撑且未放量跌破时，优先判断为持有观察、震荡或洗盘观察。
+"""
+
+        # 结构性风险（解禁/质押/两融）——A 股制度性风险因素，缺失时显式声明不可排除
+        if is_cn_equity:
+            structural_block = (
+                fundamental_context.get("structural_risk", {})
+                if isinstance(fundamental_context, dict)
+                else {}
+            )
+            structural_data = (
+                structural_block.get("data", {})
+                if isinstance(structural_block, dict)
+                else {}
+            )
+            if not isinstance(structural_data, dict):
+                structural_data = {}
+            release_info = structural_data.get("restricted_release")
+            release_info = release_info if isinstance(release_info, dict) else {}
+            pledge_info = structural_data.get("pledge")
+            pledge_info = pledge_info if isinstance(pledge_info, dict) else {}
+            margin_info = structural_data.get("margin")
+            margin_info = margin_info if isinstance(margin_info, dict) else {}
+
+            structural_rows: List[str] = []
+            if release_info:
+                release_window = release_info.get("window_days") or 90
+                release_count = release_info.get("event_count") or 0
+                if release_count:
+                    release_detail = f"{release_count} 次，最近 {release_info.get('next_release_date') or 'N/A'}"
+                    total_ratio = release_info.get("total_ratio_pct")
+                    if total_ratio is not None:
+                        release_detail += f"，合计约占总股本 {total_ratio}%"
+                    structural_rows.append(
+                        f"| 未来{release_window}天限售解禁 | {release_detail} | 解禁前后注意抛压与股东减持公告 |"
+                    )
+                else:
+                    structural_rows.append(
+                        f"| 未来{release_window}天限售解禁 | 数据源口径内无解禁事件 | |"
+                    )
+            if pledge_info:
+                pledge_ratio = pledge_info.get("pledge_ratio_pct")
+                if pledge_info.get("in_table") and pledge_ratio is not None:
+                    structural_rows.append(
+                        f"| 股权质押比例 | {pledge_ratio}%（截至 {pledge_info.get('as_of') or 'N/A'}） "
+                        "| 比例越高，股价下跌引发平仓连锁风险越大，高于30%需重点警惕 |"
+                    )
+                elif pledge_info.get("in_table") is False:
+                    structural_rows.append(
+                        "| 股权质押比例 | 未见于全市场质押统计（通常表示无质押记录） | |"
+                    )
+            if margin_info:
+                if margin_info.get("is_margin_target") is False:
+                    structural_rows.append("| 融资融券 | 非两融标的 | |")
+                elif margin_info.get("margin_balance") is not None:
+                    margin_text = self._format_amount(margin_info.get("margin_balance"))
+                    margin_change = margin_info.get("margin_balance_change_pct")
+                    if isinstance(margin_change, (int, float)):
+                        margin_text += f"，较 {margin_info.get('prev_date') or '前期'} {margin_change:+.2f}%"
+                    structural_rows.append(
+                        f"| 融资余额 | {margin_text}（截至 {margin_info.get('as_of') or 'N/A'}） "
+                        "| 杠杆资金持续流入偏暖；快速下降说明杠杆资金撤离 |"
+                    )
+
+            if structural_rows:
+                structural_table = "\n".join(structural_rows)
+                prompt += f"""
+### 结构性风险（A股制度性因素）
+| 项目 | 数据 | 决策含义 |
+|------|------|----------|
+{structural_table}
+
+> 上表未覆盖的项目按“数据缺失”处理；禁止编造解禁日期、质押比例或两融数据。
+"""
+            else:
+                prompt += """
+### 结构性风险（A股制度性因素）
+> 本次未获取到解禁/质押/两融数据，相关风险不能排除。
+> `risk_alerts` 中不得声称“无解禁压力”“无质押风险”；如需提及此类因素，必须标注“数据缺失，无法判断”。
 """
 
         # 添加三大法人动向（台股筹码过滤器）— tw-only；仅当 institution 区块 status='ok'

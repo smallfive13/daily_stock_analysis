@@ -165,6 +165,56 @@ def _normalize_report_date(value: Any) -> Optional[str]:
     return parsed.date().isoformat() if parsed else None
 
 
+def _percentile_rank(series: Any, current: float, min_points: int = 120) -> Optional[float]:
+    """
+    Percentile (0-100) of `current` within the positive values of a series.
+
+    Returns None when the sample is too small to be statistically meaningful.
+    """
+    if series is None or current is None:
+        return None
+    try:
+        values = pd.to_numeric(pd.Series(series), errors="coerce").dropna()
+        values = values[values > 0]
+    except Exception:
+        return None
+    if len(values) < max(1, min_points):
+        return None
+    try:
+        return round(float((values <= float(current)).mean() * 100.0), 1)
+    except Exception:
+        return None
+
+
+def _recent_fridays(count: int) -> List[str]:
+    """Most recent Fridays (inclusive of today if Friday), newest first, as YYYYMMDD."""
+    today = datetime.now().date()
+    offset = (today.weekday() - 4) % 7
+    friday = today - timedelta(days=offset)
+    return [(friday - timedelta(weeks=i)).strftime("%Y%m%d") for i in range(max(1, count))]
+
+
+def _recent_weekdays_desc(count: int, before: Optional[datetime] = None) -> List[str]:
+    """Most recent weekdays strictly before `before` (default now), newest first, as YYYYMMDD."""
+    anchor = (before or datetime.now()).date()
+    days: List[str] = []
+    cursor = anchor - timedelta(days=1)
+    while len(days) < max(1, count):
+        if cursor.weekday() < 5:
+            days.append(cursor.strftime("%Y%m%d"))
+        cursor -= timedelta(days=1)
+    return days
+
+
+def _has_code_column(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    return any(
+        any(k in str(c) for k in ("代码", "股票代码", "证券代码", "symbol", "ts_code"))
+        for c in df.columns
+    )
+
+
 def _build_dividend_payload(
     dividend_df: pd.DataFrame,
     stock_code: str,
@@ -328,11 +378,20 @@ class AkshareFundamentalAdapter:
                     "roe": roe,
                     "gross_margin": gross_margin,
                 }
+                # 净现比：同一报表行内取值，单位一致；净利润为非正时比值语义失真，不计算
+                ocf_to_net_profit_ratio = None
+                if (
+                    operating_cash_flow is not None
+                    and net_profit_parent is not None
+                    and net_profit_parent > 0
+                ):
+                    ocf_to_net_profit_ratio = round(operating_cash_flow / net_profit_parent, 4)
                 financial_report_payload = {
                     "report_date": report_date,
                     "revenue": revenue,
                     "net_profit_parent": net_profit_parent,
                     "operating_cash_flow": operating_cash_flow,
+                    "ocf_to_net_profit_ratio": ocf_to_net_profit_ratio,
                     "roe": roe,
                 }
                 if any(v is not None for v in financial_report_payload.values()):
@@ -529,4 +588,245 @@ class AkshareFundamentalAdapter:
         )
         result["status"] = "ok"
         result["source_chain"].append(f"dragon_tiger:{source}")
+        return result
+
+    def get_valuation_profile(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return valuation reference data: PE/PB historical percentiles and
+        industry medians, so the LLM never judges valuation without anchors.
+
+        Percentiles use the stock's own PE-TTM/PB daily history (positive
+        values only). Industry medians come from East Money industry-board
+        constituents; note their PE is the dynamic metric, recorded in
+        `industry_pe_metric` to keep 口径 explicit.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "profile": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        code = _normalize_code(stock_code)
+        profile: Dict[str, Any] = {}
+
+        hist_df, hist_source, hist_errors = self._call_df_candidates([
+            ("stock_a_indicator_lg", {"symbol": code}),
+            ("stock_a_lg_indicator", {"symbol": code}),
+        ])
+        result["errors"].extend(hist_errors)
+        if hist_df is not None:
+            date_col = next(
+                (c for c in hist_df.columns if any(k in str(c).lower() for k in ("trade_date", "date", "日期"))),
+                None,
+            )
+            lower_cols = {str(c).strip().lower(): c for c in hist_df.columns}
+            pe_col = lower_cols.get("pe_ttm") or lower_cols.get("pe")
+            pb_col = lower_cols.get("pb")
+            if date_col is not None and (pe_col is not None or pb_col is not None):
+                try:
+                    work = hist_df.copy()
+                    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+                    work = work.dropna(subset=[date_col]).sort_values(date_col)
+                except Exception:
+                    work = pd.DataFrame()
+                if not work.empty:
+                    latest = work.iloc[-1]
+                    # Anchor windows on the data's own latest date to avoid clock drift.
+                    anchor = latest[date_col]
+                    current_pe = _safe_float(latest.get(pe_col)) if pe_col is not None else None
+                    current_pb = _safe_float(latest.get(pb_col)) if pb_col is not None else None
+                    if current_pe is not None and current_pe > 0:
+                        profile["pe_ttm"] = round(current_pe, 2)
+                    if current_pb is not None and current_pb > 0:
+                        profile["pb"] = round(current_pb, 2)
+                    for label, days in (("3y", 365 * 3), ("5y", 365 * 5)):
+                        window = work[work[date_col] >= anchor - pd.Timedelta(days=days)]
+                        if pe_col is not None and current_pe is not None and current_pe > 0:
+                            profile[f"pe_percentile_{label}"] = _percentile_rank(window[pe_col], current_pe)
+                        if pb_col is not None and current_pb is not None and current_pb > 0:
+                            profile[f"pb_percentile_{label}"] = _percentile_rank(window[pb_col], current_pb)
+                    try:
+                        profile["history_as_of"] = anchor.date().isoformat()
+                    except Exception:
+                        pass
+                    result["source_chain"].append(f"valuation_history:{hist_source}")
+
+        info_df, _info_source, info_errors = self._call_df_candidates([
+            ("stock_individual_info_em", {"symbol": code}),
+        ])
+        result["errors"].extend(info_errors)
+        industry_name = ""
+        if info_df is not None and len(info_df.columns) >= 2:
+            item_col, value_col = list(info_df.columns)[0], list(info_df.columns)[1]
+            for _, row in info_df.iterrows():
+                if "行业" in _safe_str(row.get(item_col)):
+                    industry_name = _safe_str(row.get(value_col))
+                    break
+
+        if industry_name:
+            cons_df, cons_source, cons_errors = self._call_df_candidates([
+                ("stock_board_industry_cons_em", {"symbol": industry_name}),
+            ])
+            result["errors"].extend(cons_errors)
+            if cons_df is not None:
+                profile["industry_name"] = industry_name
+                pe_cons_col = next((c for c in cons_df.columns if "市盈率" in str(c)), None)
+                pb_cons_col = next((c for c in cons_df.columns if "市净率" in str(c)), None)
+                if pe_cons_col is not None:
+                    pes = pd.to_numeric(cons_df[pe_cons_col], errors="coerce").dropna()
+                    pes = pes[pes > 0]
+                    if len(pes) >= 5:
+                        profile["industry_pe_median"] = round(float(pes.median()), 2)
+                        profile["industry_pe_sample_count"] = int(len(pes))
+                        # East Money constituent tables expose dynamic PE, not TTM.
+                        profile["industry_pe_metric"] = "pe_dynamic_positive_only"
+                if pb_cons_col is not None:
+                    pbs = pd.to_numeric(cons_df[pb_cons_col], errors="coerce").dropna()
+                    pbs = pbs[pbs > 0]
+                    if len(pbs) >= 5:
+                        profile["industry_pb_median"] = round(float(pbs.median()), 2)
+                result["source_chain"].append(f"valuation_industry:{cons_source}")
+
+        result["profile"] = {k: v for k, v in profile.items() if v is not None}
+        result["status"] = "partial" if result["profile"] else "not_supported"
+        return result
+
+    def get_structural_risk(self, stock_code: str, horizon_days: int = 90) -> Dict[str, Any]:
+        """
+        Return A-share structural risk data: upcoming restricted-share
+        releases (解禁), share-pledge ratio (质押), and margin balance (两融).
+        Fail-open: any sub-block may be missing; never raises.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "restricted_release": {},
+            "pledge": {},
+            "margin": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        code = _normalize_code(stock_code)
+
+        # -- 限售解禁（未来 horizon_days 天） --
+        release_df, release_source, release_errors = self._call_df_candidates([
+            ("stock_restricted_release_queue_em", {"symbol": code}),
+            ("stock_restricted_release_queue_sina", {"symbol": code}),
+        ])
+        result["errors"].extend(release_errors)
+        if release_df is not None:
+            work = _filter_rows_by_code(release_df, code) if _has_code_column(release_df) else release_df
+            date_col = next((c for c in work.columns if "解禁" in str(c) and any(k in str(c) for k in ("时间", "日期"))), None)
+            ratio_col = next(
+                (c for c in work.columns if "总股本" in str(c) and any(k in str(c) for k in ("占", "比例", "比率"))),
+                None,
+            )
+            if date_col is not None:
+                now_date = datetime.now().date()
+                horizon_end = now_date + timedelta(days=max(1, horizon_days))
+                events: List[Dict[str, Any]] = []
+                for _, row in work.iterrows():
+                    parsed = _safe_datetime(row.get(date_col))
+                    if parsed is None:
+                        continue
+                    event_date = parsed.date()
+                    if now_date <= event_date <= horizon_end:
+                        ratio = _safe_float(row.get(ratio_col)) if ratio_col is not None else None
+                        events.append({"date": event_date.isoformat(), "ratio_pct": ratio})
+                events.sort(key=lambda item: item["date"])
+                ratios = [e["ratio_pct"] for e in events if e["ratio_pct"] is not None]
+                result["restricted_release"] = {
+                    "window_days": max(1, horizon_days),
+                    "event_count": len(events),
+                    "next_release_date": events[0]["date"] if events else None,
+                    "next_release_ratio_pct": events[0]["ratio_pct"] if events else None,
+                    "total_ratio_pct": round(sum(ratios), 4) if ratios else None,
+                    "as_of": now_date.isoformat(),
+                }
+                result["source_chain"].append(f"restricted_release:{release_source}")
+
+        # -- 股权质押比例（周频数据，回溯最近几个周五） --
+        for pledge_date in _recent_fridays(4):
+            pledge_df, pledge_source, pledge_errors = self._call_df_candidates([
+                ("stock_gpzy_pledge_ratio_em", {"date": pledge_date}),
+            ])
+            result["errors"].extend(pledge_errors)
+            if pledge_df is None or not _has_code_column(pledge_df):
+                continue
+            matched = _filter_rows_by_code(pledge_df, code)
+            if not matched.empty:
+                ratio = _safe_float(_pick_by_keywords(matched.iloc[0], ["质押比例", "质押率"]))
+                result["pledge"] = {
+                    "pledge_ratio_pct": ratio,
+                    "in_table": True,
+                    "as_of": pledge_date,
+                }
+            else:
+                # Whole-market table loaded but the stock is absent: usually no
+                # pledge record that week; keep the distinction explicit.
+                result["pledge"] = {
+                    "pledge_ratio_pct": None,
+                    "in_table": False,
+                    "as_of": pledge_date,
+                }
+            result["source_chain"].append(f"pledge:{pledge_source}")
+            break
+
+        # -- 融资融券余额（按交易所路由；北交所等不支持则跳过） --
+        margin_fn = None
+        if code.startswith(("6", "9")):
+            margin_fn = "stock_margin_detail_sse"
+        elif code.startswith(("0", "3")):
+            margin_fn = "stock_margin_detail_szse"
+        if margin_fn is not None:
+            latest_balance: Optional[float] = None
+            latest_date: Optional[str] = None
+            for margin_date in _recent_weekdays_desc(6):
+                margin_df, margin_source, margin_errors = self._call_df_candidates([
+                    (margin_fn, {"date": margin_date}),
+                ])
+                result["errors"].extend(margin_errors)
+                if margin_df is None or not _has_code_column(margin_df):
+                    continue
+                matched = _filter_rows_by_code(margin_df, code)
+                if matched.empty:
+                    result["margin"] = {"is_margin_target": False, "as_of": margin_date}
+                else:
+                    latest_balance = _safe_float(_pick_by_keywords(matched.iloc[0], ["融资余额"]))
+                    latest_date = margin_date
+                    result["margin"] = {
+                        "is_margin_target": True,
+                        "margin_balance": latest_balance,
+                        "as_of": margin_date,
+                    }
+                result["source_chain"].append(f"margin:{margin_source}")
+                break
+
+            if latest_balance is not None and latest_balance > 0 and latest_date is not None:
+                try:
+                    anchor = datetime.strptime(latest_date, "%Y%m%d")
+                except ValueError:
+                    anchor = None
+                if anchor is not None:
+                    # 约 5 个交易日前的余额，用于观察杠杆资金变化方向
+                    for prev_date in _recent_weekdays_desc(3, before=anchor - timedelta(days=6)):
+                        prev_df, _prev_source, prev_errors = self._call_df_candidates([
+                            (margin_fn, {"date": prev_date}),
+                        ])
+                        result["errors"].extend(prev_errors)
+                        if prev_df is None or not _has_code_column(prev_df):
+                            continue
+                        prev_matched = _filter_rows_by_code(prev_df, code)
+                        if prev_matched.empty:
+                            break
+                        prev_balance = _safe_float(_pick_by_keywords(prev_matched.iloc[0], ["融资余额"]))
+                        if prev_balance is not None and prev_balance > 0:
+                            result["margin"]["margin_balance_prev"] = prev_balance
+                            result["margin"]["prev_date"] = prev_date
+                            result["margin"]["margin_balance_change_pct"] = round(
+                                (latest_balance - prev_balance) / prev_balance * 100.0, 2
+                            )
+                        break
+
+        has_content = bool(result["restricted_release"] or result["pledge"] or result["margin"])
+        result["status"] = "partial" if has_content else "not_supported"
         return result
