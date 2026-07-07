@@ -505,6 +505,31 @@ class AkshareFundamentalAdapter:
                 }
                 result["source_chain"].append(f"capital_stock:{stock_source}")
 
+        sector_rankings = self.get_sector_fund_flow_rankings(top_n)
+        result["errors"].extend(sector_rankings.get("errors", []))
+        result["sector_rankings"] = {
+            "top": list(sector_rankings.get("top") or []),
+            "bottom": list(sector_rankings.get("bottom") or []),
+        }
+        for source in sector_rankings.get("source_chain", []) or []:
+            result["source_chain"].append(f"capital_sector:{source}")
+
+        has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_sector_fund_flow_rankings(self, top_n: int = 5) -> Dict[str, Any]:
+        """
+        Return sector fund-flow leaders and laggards.
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "top": [],
+            "bottom": [],
+            "source_chain": [],
+            "errors": [],
+        }
+
         sector_df, sector_source, sector_errors = self._call_df_candidates([
             ("stock_sector_fund_flow_rank", {}),
             ("stock_sector_fund_flow_summary", {}),
@@ -519,13 +544,13 @@ class AkshareFundamentalAdapter:
                 work_df = work_df.dropna(subset=[flow_col])
                 top_df = work_df.nlargest(top_n, flow_col)
                 bottom_df = work_df.nsmallest(top_n, flow_col)
-                result["sector_rankings"] = {
-                    "top": [{"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in top_df.iterrows()],
-                    "bottom": [{"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in bottom_df.iterrows()],
-                }
-                result["source_chain"].append(f"capital_sector:{sector_source}")
+                result["top"] = [{"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in top_df.iterrows()]
+                result["bottom"] = [
+                    {"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in bottom_df.iterrows()
+                ]
+                result["source_chain"].append(str(sector_source))
 
-        has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
+        has_content = bool(result["top"] or result["bottom"])
         result["status"] = "partial" if has_content else "not_supported"
         return result
 

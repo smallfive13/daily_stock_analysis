@@ -29,7 +29,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -1829,6 +1829,72 @@ class AkshareFetcher(BaseFetcher):
 
         except Exception as e:
             logger.warning(f"[Akshare] 获取外围市场指数失败: {e}")
+            return None
+
+    def get_index_daily_history(self, symbol: str, days: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """
+        获取 A 股指数日线历史。
+
+        Args:
+            symbol: 不带交易所前缀的 6 位指数代码，如 000001
+            days: 返回最近交易日数量
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            normalized_days = max(int(days or 30), 1)
+            end_date = datetime.now().strftime("%Y%m%d")
+            # 日线按交易日返回，拉长自然日窗口以覆盖节假日。
+            start_date = (datetime.now() - timedelta(days=max(normalized_days * 2, 45))).strftime("%Y%m%d")
+
+            logger.info("[API调用] ak.index_zh_a_hist(symbol=%s) 获取指数日线...", symbol)
+            df = ak.index_zh_a_hist(
+                symbol=str(symbol).strip(),
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if df is None or df.empty:
+                return None
+
+            def _col(*keywords: str) -> Optional[str]:
+                return next(
+                    (c for c in df.columns if any(k in str(c) for k in keywords)),
+                    None,
+                )
+
+            date_col = _col("日期", "date")
+            open_col = _col("开盘", "open")
+            high_col = _col("最高", "high")
+            low_col = _col("最低", "low")
+            close_col = _col("收盘", "close")
+            if not all((date_col, open_col, high_col, low_col, close_col)):
+                return None
+
+            work_df = df[[date_col, open_col, high_col, low_col, close_col]].copy()
+            work_df[date_col] = pd.to_datetime(work_df[date_col], errors="coerce")
+            for col in (open_col, high_col, low_col, close_col):
+                work_df[col] = pd.to_numeric(work_df[col], errors="coerce")
+            work_df = work_df.dropna(subset=[date_col, open_col, high_col, low_col, close_col])
+            if work_df.empty:
+                return None
+
+            work_df = work_df.sort_values(date_col).tail(normalized_days)
+            rows: List[Dict[str, Any]] = []
+            for _, row in work_df.iterrows():
+                rows.append({
+                    "date": row[date_col].date().isoformat(),
+                    "open": float(row[open_col]),
+                    "high": float(row[high_col]),
+                    "low": float(row[low_col]),
+                    "close": float(row[close_col]),
+                })
+            return rows
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取指数日线失败: {e}")
             return None
 
     def get_market_stats(self) -> Optional[Dict[str, Any]]:

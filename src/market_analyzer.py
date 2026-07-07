@@ -37,6 +37,12 @@ from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
 
+CN_INDEX_KEY_LEVEL_TARGETS = [
+    {"symbol": "000001", "name": "上证指数", "aliases": ("000001", "sh000001", "上证指数")},
+    {"symbol": "399006", "name": "创业板指", "aliases": ("399006", "sz399006", "创业板指")},
+    {"symbol": "000688", "name": "科创50", "aliases": ("000688", "sh000688", "科创50")},
+]
+
 
 _ENGLISH_SECTION_PATTERNS = {
     "market_summary": r"###\s*(?:1\.\s*)?Market Summary",
@@ -107,6 +113,12 @@ class MarketOverview:
     # 外围市场联动参考（仅 A 股复盘注入；美股为最近收盘快照）
     global_indices: List[MarketIndex] = field(default_factory=list)
 
+    # A 股大盘复盘增强输入
+    fund_inflow_sectors: List[Dict] = field(default_factory=list)
+    fund_outflow_sectors: List[Dict] = field(default_factory=list)
+    limit_up_structure: Dict = field(default_factory=dict)
+    index_key_levels: List[Dict] = field(default_factory=list)
+
 
 @dataclass
 class MarketLightReviewResult:
@@ -116,6 +128,70 @@ class MarketLightReviewResult:
     report: str
     market_light_snapshot: Optional[Dict[str, Any]]
     structured_payload: Dict[str, Any] = field(default_factory=dict)
+
+
+def aggregate_limit_up_pool(rows: List[Dict]) -> Dict[str, Any]:
+    """Aggregate limit-up pool rows for market-review prompt input."""
+    if not rows:
+        return {}
+
+    industry_counts: Dict[str, int] = {}
+    max_consecutive_boards = 0
+    max_boards_stock = ""
+    total_break_count = 0
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        industry = str(row.get("industry") or "").strip()
+        if industry:
+            industry_counts[industry] = industry_counts.get(industry, 0) + 1
+
+        try:
+            boards = int(float(row.get("consecutive_boards") or 0))
+        except (TypeError, ValueError):
+            boards = 0
+        if boards > max_consecutive_boards:
+            max_consecutive_boards = boards
+            max_boards_stock = str(row.get("name") or "").strip()
+
+        try:
+            total_break_count += int(float(row.get("break_count") or 0))
+        except (TypeError, ValueError):
+            continue
+
+    industry_distribution = [
+        {"industry": industry, "count": count}
+        for industry, count in sorted(industry_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+    ]
+    return {
+        "total": len(rows),
+        "industry_distribution": industry_distribution,
+        "max_consecutive_boards": max_consecutive_boards,
+        "max_boards_stock": max_boards_stock,
+        "total_break_count": total_break_count,
+    }
+
+
+def compute_index_key_levels(bars: List[Dict]) -> Dict[str, Any]:
+    """Compute MA20 and recent 20-day high/low from ascending daily bars."""
+    if not bars or len(bars) < 20:
+        return {}
+
+    recent_bars = bars[-20:]
+    try:
+        closes = [float(bar["close"]) for bar in recent_bars]
+        highs = [float(bar["high"]) for bar in recent_bars]
+        lows = [float(bar["low"]) for bar in recent_bars]
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if not closes or not highs or not lows:
+        return {}
+    return {
+        "ma20": round(sum(closes) / len(closes), 2),
+        "high_20d": round(max(highs), 2),
+        "low_20d": round(min(lows), 2),
+    }
 
 
 class MarketAnalyzer:
@@ -442,17 +518,23 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 2. 获取涨跌统计（A 股有，美股无等效数据）
         if self.profile.has_market_stats:
             self._get_market_statistics(overview)
+            self._get_limit_up_structure(overview)
 
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
             self._get_concept_rankings(overview)
+            self._get_sector_fund_flow_rankings(overview)
         
         # 4. 获取外围市场联动数据（仅 A 股复盘，fail-open）
         if self.profile.has_global_context:
             self._get_global_indices(overview)
 
-        # 5. 获取北向资金（可选）
+        # 5. 获取指数关键位参考（仅 A 股复盘，fail-open）
+        if self.region == "cn":
+            self._get_index_key_levels(overview)
+
+        # 6. 获取北向资金（可选）
         # self._get_north_flow(overview)
 
         return overview
@@ -577,6 +659,48 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.warning("[大盘] %s action=get_concept_rankings status=failed error=%s", self._log_context(), e)
+
+    def _get_sector_fund_flow_rankings(self, overview: MarketOverview):
+        """获取板块资金流排行（fail-open）。"""
+        try:
+            logger.info("[大盘] %s action=get_sector_fund_flow_rankings status=start", self._log_context())
+
+            top_sectors, bottom_sectors = self.data_manager.get_sector_fund_flow_rankings(5)
+            if top_sectors or bottom_sectors:
+                overview.fund_inflow_sectors = top_sectors
+                overview.fund_outflow_sectors = bottom_sectors
+
+                logger.info(
+                    "[大盘] %s action=get_sector_fund_flow_rankings status=success top=%s bottom=%s",
+                    self._log_context(),
+                    [s.get('name') for s in overview.fund_inflow_sectors],
+                    [s.get('name') for s in overview.fund_outflow_sectors],
+                )
+            else:
+                logger.warning("[大盘] %s action=get_sector_fund_flow_rankings status=empty", self._log_context())
+
+        except Exception as e:
+            logger.warning("[大盘] %s action=get_sector_fund_flow_rankings status=failed error=%s", self._log_context(), e)
+
+    def _get_limit_up_structure(self, overview: MarketOverview):
+        """获取涨停结构（fail-open）。"""
+        try:
+            logger.info("[大盘] %s action=get_limit_up_structure status=start", self._log_context())
+
+            rows = self.data_manager.get_limit_up_pool(n=200)
+            overview.limit_up_structure = aggregate_limit_up_pool(rows or [])
+
+            if overview.limit_up_structure:
+                logger.info(
+                    "[大盘] %s action=get_limit_up_structure status=success total=%s",
+                    self._log_context(),
+                    overview.limit_up_structure.get("total"),
+                )
+            else:
+                logger.warning("[大盘] %s action=get_limit_up_structure status=empty", self._log_context())
+
+        except Exception as e:
+            logger.warning("[大盘] %s action=get_limit_up_structure status=failed error=%s", self._log_context(), e)
     
     def _get_global_indices(self, overview: MarketOverview):
         """获取外围市场联动参考指数（fail-open，失败不影响复盘主流程）。"""
@@ -612,6 +736,61 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 logger.warning("[大盘] %s action=get_global_indices status=empty", self._log_context())
         except Exception as e:
             logger.warning("[大盘] %s action=get_global_indices status=failed error=%s", self._log_context(), e)
+
+    def _get_index_key_levels(self, overview: MarketOverview):
+        """获取指数关键位参考（fail-open，失败不影响复盘主流程）。"""
+        try:
+            logger.info("[大盘] %s action=get_index_key_levels status=start", self._log_context())
+
+            index_by_target = self._match_index_key_level_targets(overview.indices)
+            for target in CN_INDEX_KEY_LEVEL_TARGETS:
+                index = index_by_target.get(target["symbol"])
+                if index is None:
+                    continue
+                try:
+                    bars = self.data_manager.get_index_daily_history(target["symbol"], days=30)
+                    levels = compute_index_key_levels(bars or [])
+                except Exception as e:
+                    logger.warning(
+                        "[大盘] %s action=get_index_key_levels status=index_failed symbol=%s error=%s",
+                        self._log_context(),
+                        target["symbol"],
+                        e,
+                    )
+                    continue
+                if not levels:
+                    continue
+                overview.index_key_levels.append({
+                    "name": target["name"],
+                    "current": index.current,
+                    "ma20": levels["ma20"],
+                    "high_20d": levels["high_20d"],
+                    "low_20d": levels["low_20d"],
+                })
+
+            if overview.index_key_levels:
+                logger.info(
+                    "[大盘] %s action=get_index_key_levels status=success count=%d",
+                    self._log_context(),
+                    len(overview.index_key_levels),
+                )
+            else:
+                logger.warning("[大盘] %s action=get_index_key_levels status=empty", self._log_context())
+        except Exception as e:
+            logger.warning("[大盘] %s action=get_index_key_levels status=failed error=%s", self._log_context(), e)
+
+    @staticmethod
+    def _match_index_key_level_targets(indices: List[MarketIndex]) -> Dict[str, MarketIndex]:
+        result: Dict[str, MarketIndex] = {}
+        for target in CN_INDEX_KEY_LEVEL_TARGETS:
+            aliases = tuple(str(alias).lower() for alias in target["aliases"])
+            for idx in indices or []:
+                code = str(getattr(idx, "code", "") or "").lower()
+                name = str(getattr(idx, "name", "") or "").lower()
+                if any(alias and (code.endswith(alias) or name == alias) for alias in aliases):
+                    result[target["symbol"]] = idx
+                    break
+        return result
 
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -1316,6 +1495,64 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             parts.append(f"{name}({cls._format_signed_pct(item.get('change_pct'))})")
         return ", ".join(parts)
 
+    @classmethod
+    def _format_fund_flow_summary(cls, rows: List[Dict], limit: int = 3) -> str:
+        parts = []
+        for item in (rows or [])[:limit]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                net_inflow = float(item.get("net_inflow"))
+            except (TypeError, ValueError):
+                parts.append(name)
+                continue
+            parts.append(f"{name}({net_inflow:+.2f})")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _format_limit_up_industries(distribution: List[Dict]) -> str:
+        parts = []
+        for item in distribution or []:
+            if not isinstance(item, dict):
+                continue
+            industry = str(item.get("industry") or "").strip()
+            if not industry:
+                continue
+            try:
+                count = int(item.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                parts.append(f"{industry}({count}家)")
+        return "、".join(parts)
+
+    @staticmethod
+    def _format_limit_up_industries_en(distribution: List[Dict]) -> str:
+        parts = []
+        for item in distribution or []:
+            if not isinstance(item, dict):
+                continue
+            industry = str(item.get("industry") or "").strip()
+            if not industry:
+                continue
+            try:
+                count = int(item.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                parts.append(f"{industry}({count})")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _format_optional_level(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "N/A"
+
     @staticmethod
     def _escape_markdown_link_label(value: str) -> str:
         return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
@@ -1405,16 +1642,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 (Interpret what turnover, participation, and flow signals imply.)
 
 ### 4. Sector Highlights
-(Distinguish industry-sector moves from concept/theme moves, then analyze drivers and persistence; when global context shows a big move in a related industry, explain the cross-market linkage.)
+(Distinguish industry-sector moves from concept/theme moves, then analyze drivers and persistence; when global context shows a big move in a related industry, explain the cross-market linkage. Cross-check fund inflow/outflow leaders against gain/loss rankings; if a sector rises while showing fund outflow, flag questionable persistence.)
 
 ### 5. Outlook
-(Provide the near-term outlook based on price action, news, and — when provided — global market context; prefer observable overseas triggers for invalidation conditions.)
+(Provide the near-term outlook based on price action, news, and — when provided — global market context; combine the limit-up structure, consecutive-board height, and break count to judge sentiment strength and loss-making effects.)
 
 ### 6. Risk Alerts
 (List the main risks to monitor.)
 
 ### 7. Strategy Plan
-(Provide an offensive/balanced/defensive stance, a position-sizing guideline, one invalidation trigger, and end with "For reference only, not investment advice.")"""
+(Provide an offensive/balanced/defensive stance, a position-sizing guideline, and one invalidation trigger anchored to provided observable data such as index key levels, global indices, or sector fund-flow persistence; do not use unverifiable wording like "if the market weakens". End with "For reference only, not investment advice.")"""
 
             section_number = 3
             sections: List[str] = []
@@ -1440,16 +1677,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         if self.profile.has_market_stats and self.profile.has_sector_rankings:
             return """### 三、板块主线
-（区分行业板块与概念题材，分析领涨/领跌背后的逻辑、持续性和是否形成主线；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系，说明"谁在打谁、资金从哪来到哪去"）
+（区分行业板块与概念题材，分析领涨/领跌背后的逻辑、持续性和是否形成主线；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系，说明"谁在打谁、资金从哪来到哪去"；资金净流入/流出榜与涨跌幅榜交叉验证：涨幅高但资金流出的板块要提示持续性存疑）
 
 ### 四、资金与情绪
-（解读成交额、涨跌停结构、市场宽度和风险偏好）
+（解读成交额、涨跌停结构、市场宽度和风险偏好；结合涨停结构（连板高度、炸板情况）判断情绪强度与亏钱效应）
 
 ### 五、消息催化
 （结合近三日新闻与外围市场表现，先判断当日走势是否由外围事件驱动，再提炼真正影响明日交易的催化或扰动；新闻与外围数据均缺失时明确说明，不得写"今日无消息"）
 
 ### 六、明日交易计划
-（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件；已提供外围数据时，触发条件应优先引用可观察的外围信号，如"隔夜费城半导体能否企稳"）
+（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件；触发失效条件必须引用已提供的可观察锚点（指数关键位、外围指数或板块资金持续性），禁止使用"若市场走弱"这类不可验证表述）
 
 ### 七、风险提示
 （列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）"""
@@ -1499,6 +1736,79 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         bottom_sectors_text = self._format_ranking_summary(overview.bottom_sectors)
         top_concepts_text = self._format_ranking_summary(overview.top_concepts)
         bottom_concepts_text = self._format_ranking_summary(overview.bottom_concepts)
+        fund_inflow_text = self._format_fund_flow_summary(getattr(overview, "fund_inflow_sectors", []))
+        fund_outflow_text = self._format_fund_flow_summary(getattr(overview, "fund_outflow_sectors", []))
+
+        limit_up_block = ""
+        limit_up_structure = getattr(overview, "limit_up_structure", {}) or {}
+        if self.profile.has_market_stats and limit_up_structure:
+            max_stock = str(limit_up_structure.get("max_boards_stock") or "").strip()
+            max_boards = int(limit_up_structure.get("max_consecutive_boards") or 0)
+            total_break_count = int(limit_up_structure.get("total_break_count") or 0)
+            industry_distribution = limit_up_structure.get("industry_distribution") or []
+            if review_language == "en":
+                max_stock_text = f" ({max_stock})" if max_stock else ""
+                industry_text = self._format_limit_up_industries_en(industry_distribution)
+                limit_up_block = (
+                    "## Limit-up Structure\n"
+                    f"- Limit-up pool: {int(limit_up_structure.get('total') or 0)} stocks | "
+                    f"Highest consecutive boards: {max_boards}{max_stock_text} | "
+                    f"Total break count: {total_break_count}\n"
+                )
+                if industry_text:
+                    limit_up_block += f"- Limit-up industry distribution: {industry_text}"
+            else:
+                max_stock_text = f"（{max_stock}）" if max_stock else ""
+                industry_text = self._format_limit_up_industries(industry_distribution)
+                limit_up_block = (
+                    "## 涨停结构\n"
+                    f"- 涨停池数量: {int(limit_up_structure.get('total') or 0)} 家 | "
+                    f"最高连板: {max_boards} 板{max_stock_text} | 炸板次数合计: {total_break_count}\n"
+                )
+                if industry_text:
+                    limit_up_block += f"- 涨停行业分布: {industry_text}"
+
+        index_key_levels_block = ""
+        index_key_levels = getattr(overview, "index_key_levels", []) or []
+        if index_key_levels:
+            if review_language == "en":
+                rows = [
+                    "| Index | Current | MA20 | 20D High | 20D Low |",
+                    "| --- | ---: | ---: | ---: | ---: |",
+                ]
+                for item in index_key_levels:
+                    rows.append(
+                        "| {name} | {current} | {ma20} | {high_20d} | {low_20d} |".format(
+                            name=item.get("name") or "",
+                            current=self._format_optional_level(item.get("current")),
+                            ma20=self._format_optional_level(item.get("ma20")),
+                            high_20d=self._format_optional_level(item.get("high_20d")),
+                            low_20d=self._format_optional_level(item.get("low_20d")),
+                        )
+                    )
+                index_key_levels_block = (
+                    "## Index Key Levels Reference (daily-bar local calculation, not a forecast)\n"
+                    + "\n".join(rows)
+                )
+            else:
+                rows = [
+                    "| 指数 | 现价 | MA20 | 近20日高 | 近20日低 |",
+                    "| --- | ---: | ---: | ---: | ---: |",
+                ]
+                for item in index_key_levels:
+                    rows.append(
+                        "| {name} | {current} | {ma20} | {high_20d} | {low_20d} |".format(
+                            name=item.get("name") or "",
+                            current=self._format_optional_level(item.get("current")),
+                            ma20=self._format_optional_level(item.get("ma20")),
+                            high_20d=self._format_optional_level(item.get("high_20d")),
+                            low_20d=self._format_optional_level(item.get("low_20d")),
+                        )
+                    )
+                index_key_levels_block = "## 指数关键位参考（基于日线本地计算，非预测）\n" + "\n".join(rows)
+
+        p2_context_blocks = [block for block in (limit_up_block, index_key_levels_block) if block]
+        p2_context_block = ("\n\n" + "\n\n".join(p2_context_blocks)) if p2_context_blocks else ""
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
@@ -1568,6 +1878,10 @@ Industry leading: {top_sectors_text if top_sectors_text else "N/A"}
 Industry lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}
 Concept leading: {top_concepts_text if top_concepts_text else "N/A"}
 Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
+                if fund_inflow_text:
+                    sector_block += f"\nFund inflow leaders: {fund_inflow_text}"
+                if fund_outflow_text:
+                    sector_block += f"\nFund outflow laggards: {fund_outflow_text}"
 
             data_limit_lines = []
             if not self.profile.has_market_stats:
@@ -1591,6 +1905,10 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 行业领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}
 概念领涨: {top_concepts_text if top_concepts_text else "暂无数据"}
 概念领跌: {bottom_concepts_text if bottom_concepts_text else "暂无数据"}"""
+                if fund_inflow_text:
+                    sector_block += f"\n资金净流入板块: {fund_inflow_text}"
+                if fund_outflow_text:
+                    sector_block += f"\n资金净流出板块: {fund_outflow_text}"
 
             data_limit_lines = []
             if not self.profile.has_market_stats:
@@ -1704,7 +2022,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
 {stats_block}
 
-{sector_block}
+{sector_block}{p2_context_block}
 
 {data_limits_block}
 
@@ -1760,7 +2078,7 @@ Output the report content directly, no extra commentary.
 
 {stats_block}
 
-{sector_block}
+{sector_block}{p2_context_block}
 
 {data_limits_block}
 

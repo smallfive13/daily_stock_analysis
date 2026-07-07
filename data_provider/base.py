@@ -445,6 +445,16 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_index_daily_history(self, symbol: str, days: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """
+        获取指数日线历史。
+
+        Args:
+            symbol: 不带交易所前缀的指数代码
+            days: 返回最近天数
+        """
+        return None
+
     def get_daily_data(
         self,
         stock_code: str, 
@@ -2498,6 +2508,22 @@ class DataFetcherManager:
                 continue
         return []
 
+    def get_index_daily_history(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取指数日线历史（自动切换数据源，fail-open）。"""
+        for fetcher in self._get_fetchers_snapshot():
+            getter = getattr(fetcher, "get_index_daily_history", None)
+            if getter is None:
+                continue
+            try:
+                data = getter(symbol, days=days)
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取指数日线成功")
+                    return data
+            except Exception as e:
+                logger.warning(f"[{fetcher.name}] 获取指数日线失败: {e}")
+                continue
+        return []
+
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)
@@ -3838,6 +3864,17 @@ class DataFetcherManager:
                 cached_bottom,
             )
             return self._copy_ranking_rows(cached_top), self._copy_ranking_rows(cached_bottom)
+
+    def get_sector_fund_flow_rankings(self, top_n: int = 5) -> Tuple[List[Dict], List[Dict]]:
+        """获取板块资金流排行（fail-open）。"""
+        try:
+            result = self._fundamental_adapter.get_sector_fund_flow_rankings(top_n)
+            if result and (result.get("top") or result.get("bottom")):
+                logger.info("[板块资金流] 获取排行成功")
+                return result.get("top") or [], result.get("bottom") or []
+        except Exception as e:
+            logger.warning("[板块资金流] 获取排行失败: %s", e)
+        return [], []
 
     def get_hot_stocks(self, n: int = 10) -> List[Dict[str, Any]]:
         """获取市场人气股榜（自动切换数据源）。"""

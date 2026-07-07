@@ -185,7 +185,10 @@ class SectionHintTestCase(unittest.TestCase):
         self.assertIn("联动关系", sections)
         self.assertIn("谁在打谁、资金从哪来到哪去", sections)
         self.assertIn("先判断当日走势是否由外围事件驱动", sections)
-        self.assertIn("隔夜费城半导体能否企稳", sections)
+        self.assertIn("资金净流入/流出榜与涨跌幅榜交叉验证", sections)
+        self.assertIn("结合涨停结构（连板高度、炸板情况）", sections)
+        self.assertIn("触发失效条件必须引用已提供的可观察锚点", sections)
+        self.assertIn("禁止使用\"若市场走弱\"这类不可验证表述", sections)
 
 
 if __name__ == "__main__":
