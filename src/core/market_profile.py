@@ -25,6 +25,8 @@ class MarketProfile:
     has_market_stats: bool
     # 市场概况是否包含板块涨跌（A 股有，美股暂无）
     has_sector_rankings: bool
+    # 是否注入外围市场联动数据（目前仅 A 股复盘需要）
+    has_global_context: bool = False
 
 
 CN_PROFILE = MarketProfile(
@@ -32,12 +34,13 @@ CN_PROFILE = MarketProfile(
     mood_index_code="000001",
     news_queries=[
         "A股 大盘 复盘",
-        "股市 行情 分析",
+        "隔夜 美股 全球市场 大事件",
         "A股 市场 热点 板块",
     ],
     prompt_index_hint="分析上证、深证、创业板等各指数走势特点",
     has_market_stats=True,
     has_sector_rankings=True,
+    has_global_context=True,
 )
 
 US_PROFILE = MarketProfile(

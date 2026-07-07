@@ -1749,6 +1749,88 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 获取指数行情失败: {e}")
             return None
 
+    # 东财全球指数表中的名称关键字 -> (结果 code, 标准名称)
+    _GLOBAL_CONTEXT_NAME_MAP = {
+        '标普500': ('SPX', '标普500'),
+        '纳斯达克': ('IXIC', '纳斯达克'),
+        '日经225': ('N225', '日经225'),
+        '恒生指数': ('HSI', '恒生指数'),
+        'KOSPI': ('KS11', '韩国KOSPI'),
+        '美元指数': ('DXY', '美元指数'),
+        '费城半导体': ('SOX', '费城半导体指数'),
+    }
+
+    def get_global_context_indices(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        获取外围市场联动参考指数（东财全球指数接口，国内网络可达的兜底源）。
+
+        覆盖面取决于接口当日返回的名称集合，按关键字宽松匹配；
+        全部未命中或接口失败时返回 None（fail-open）。
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            df = ak.index_global_spot_em()
+            if df is None or df.empty:
+                return None
+
+            name_col = next((c for c in df.columns if '名称' in str(c)), None)
+            if name_col is None:
+                return None
+
+            def _col(*keywords: str) -> Optional[str]:
+                return next(
+                    (c for c in df.columns if any(k in str(c) for k in keywords)),
+                    None,
+                )
+
+            price_col = _col('最新价', '最新')
+            change_col = _col('涨跌额')
+            pct_col = _col('涨跌幅')
+            open_col = _col('开盘', '今开')
+            high_col = _col('最高')
+            low_col = _col('最低')
+            prev_close_col = _col('昨收', '前收')
+            if price_col is None or pct_col is None:
+                return None
+
+            results = []
+            for keyword, (code, std_name) in self._GLOBAL_CONTEXT_NAME_MAP.items():
+                row = df[df[name_col].astype(str).str.contains(keyword, na=False)]
+                if row.empty:
+                    continue
+                row = row.iloc[0]
+                prev_close = safe_float(row.get(prev_close_col, 0)) if prev_close_col else 0.0
+                high = safe_float(row.get(high_col, 0)) if high_col else 0.0
+                low = safe_float(row.get(low_col, 0)) if low_col else 0.0
+                amplitude = (high - low) / prev_close * 100 if prev_close > 0 else 0.0
+                results.append({
+                    'code': code,
+                    'name': std_name,
+                    'current': safe_float(row.get(price_col, 0)),
+                    'change': safe_float(row.get(change_col, 0)) if change_col else 0.0,
+                    'change_pct': safe_float(row.get(pct_col, 0)),
+                    'open': safe_float(row.get(open_col, 0)) if open_col else 0.0,
+                    'high': high,
+                    'low': low,
+                    'prev_close': prev_close,
+                    'volume': 0.0,
+                    'amount': 0.0,
+                    'amplitude': amplitude,
+                })
+
+            if results:
+                logger.info(f"[Akshare] 成功获取 {len(results)} 个外围市场指数行情")
+                return results
+            return None
+
+        except Exception as e:
+            logger.warning(f"[Akshare] 获取外围市场指数失败: {e}")
+            return None
+
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """
         获取市场涨跌统计

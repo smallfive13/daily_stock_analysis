@@ -2482,6 +2482,22 @@ class DataFetcherManager:
                 continue
         return []
 
+    def get_global_market_indices(self) -> List[Dict[str, Any]]:
+        """获取外围市场联动参考指数（自动切换数据源，fail-open）。"""
+        for fetcher in self._fetchers:
+            getter = getattr(fetcher, "get_global_context_indices", None)
+            if getter is None:
+                continue
+            try:
+                data = getter()
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取外围市场指数成功")
+                    return data
+            except Exception as e:
+                logger.warning(f"[{fetcher.name}] 获取外围市场指数失败: {e}")
+                continue
+        return []
+
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)

@@ -387,6 +387,40 @@ class YfinanceFetcher(BaseFetcher):
 
         return None
 
+    # A 股复盘外围联动参考指数：(yfinance 符号, 中文名称, 结果 code)
+    _GLOBAL_CONTEXT_INDICES = [
+        ('^GSPC', '标普500', 'SPX'),
+        ('^IXIC', '纳斯达克', 'IXIC'),
+        ('^SOX', '费城半导体指数', 'SOX'),
+        ('^N225', '日经225', 'N225'),
+        ('^KS11', '韩国KOSPI', 'KS11'),
+        ('^HSI', '恒生指数', 'HSI'),
+        ('DX-Y.NYB', '美元指数', 'DXY'),
+    ]
+
+    def get_global_context_indices(self) -> Optional[List[Dict[str, Any]]]:
+        """
+        获取外围市场联动参考指数（供 A 股大盘复盘注入外围数据块）。
+
+        与 get_main_indices 相同的行情字典结构；单个指数失败不影响其余，
+        全部失败返回 None（fail-open）。
+        """
+        import yfinance as yf
+
+        results = []
+        for yf_symbol, name, code in self._GLOBAL_CONTEXT_INDICES:
+            try:
+                item = self._fetch_yf_ticker_data(yf, yf_symbol, name, code)
+                if item:
+                    results.append(item)
+            except Exception as e:
+                logger.warning(f"[Yfinance] 获取外围指数 {name} 失败: {e}")
+
+        if results:
+            logger.info(f"[Yfinance] 成功获取 {len(results)} 个外围市场指数行情")
+            return results
+        return None
+
     def _get_us_main_indices(self, yf) -> Optional[List[Dict[str, Any]]]:
         """获取美股主要指数行情（SPX、IXIC、DJI、VIX），复用 _fetch_yf_ticker_data"""
         # 大盘复盘所需核心美股指数
