@@ -83,6 +83,10 @@ verify_*.py
 !.claude/skills/
 !.claude/skills/**
 
+# ignore agent-tool runtime mirrors (e.g. Codex regenerates .agents/skills/ from
+# .claude/skills/ on startup); the canonical source stays .claude/skills/
+.agents/
+
 # ignore static files
 static/
 /apps/dsa-desktop/dist/
