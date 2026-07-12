@@ -1145,14 +1145,19 @@ class StockAnalysisPipeline:
 
         top_concepts, bottom_concepts = self._get_concept_rankings_for_market(market)
 
-        if top_concepts or bottom_concepts:
-            enriched_context["concept_boards"] = {
-                "status": "ok" if top_concepts and bottom_concepts else "partial",
-                "data": {
-                    "top": top_concepts,
-                    "bottom": bottom_concepts,
-                },
-            }
+        concept_data: Dict[str, Any] = {
+            "top": top_concepts,
+            "bottom": bottom_concepts,
+        }
+        if not top_concepts and not bottom_concepts:
+            # Empty lists are removed while fundamental contexts are merged.
+            # Keep a non-empty internal marker so downstream consumers can
+            # distinguish an attempted empty result from a missing preload.
+            concept_data["fetch_attempted"] = True
+        enriched_context["concept_boards"] = {
+            "status": "ok" if top_concepts and bottom_concepts else "partial",
+            "data": concept_data,
+        }
 
     def _get_concept_rankings_for_market(
         self,

@@ -11,6 +11,7 @@ from api.v1.schemas.history import ReportDetails
 from data_provider.base import DataFetcherManager
 from src.core.pipeline import StockAnalysisPipeline
 from src.services.market_hotspot_service import MarketHotspotService
+from src.services.market_structure_service import MarketStructureService
 from src.utils.data_processing import (
     extract_board_detail_fields,
     extract_market_structure_detail_field,
@@ -116,6 +117,59 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
         pipeline.fetcher_manager.get_concept_rankings.assert_called_once_with(5)
         self.assertEqual(first["concept_boards"]["data"]["top"][0]["name"], "Robot Theme")
         self.assertEqual(second["concept_boards"]["data"]["top"][0]["name"], "Robot Theme")
+
+    def test_empty_concept_rankings_are_reused_by_market_structure_builds(self) -> None:
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.fetcher_manager = MagicMock()
+        pipeline.fetcher_manager.get_belong_boards.side_effect = [
+            [{"name": "Robot Theme", "type": "concept"}],
+            [{"name": "AI Theme", "type": "concept"}],
+        ]
+        pipeline.fetcher_manager.get_concept_rankings.return_value = ([], [])
+
+        context = {
+            "market": "cn",
+            "status": "ok",
+            "coverage": {"boards": "ok"},
+            "boards": {
+                "status": "ok",
+                "data": {
+                    "top": [{"name": "Technology", "change_pct": 1.2}],
+                    "bottom": [],
+                },
+            },
+        }
+
+        first = pipeline._attach_belong_boards_to_fundamental_context("600519", context)
+        second = pipeline._attach_belong_boards_to_fundamental_context("000001", context)
+
+        self.assertEqual(first["concept_boards"]["status"], "partial")
+        self.assertEqual(first["concept_boards"]["data"]["top"], [])
+        self.assertTrue(first["concept_boards"]["data"]["fetch_attempted"])
+        self.assertEqual(
+            extract_board_detail_fields(
+                {"fundamental_context": first}
+            )["concept_rankings"],
+            {"top": [], "bottom": [], "status": "partial"},
+        )
+
+        market_structure_service = MarketStructureService(
+            fetcher_manager=pipeline.fetcher_manager,
+        )
+        market_structure_service.build_context(
+            code="600519",
+            stock_name="First",
+            market="cn",
+            fundamental_context=first,
+        )
+        market_structure_service.build_context(
+            code="000001",
+            stock_name="Second",
+            market="cn",
+            fundamental_context=second,
+        )
+
+        pipeline.fetcher_manager.get_concept_rankings.assert_called_once_with(5)
 
     def test_get_concept_rankings_for_market_no_long_block_with_hanging_fetcher(self) -> None:
         fetcher = _HangingConceptRankingFetcher()
