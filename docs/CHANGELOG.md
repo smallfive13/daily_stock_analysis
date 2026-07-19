@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 个股新闻与综合情报改用硬日期边界和直接标的准入：最新消息、风险、公告必须同时具备发布日期并命中股票名或代码，避免“最新但不相关”与无日期旧资料混入催化/风险结论。
+- [改进] 综合情报每个维度统一按 Tavily、SearXNG、其余可用源依次回退；A 股 Tavily 严格维度限定主流财经/交易所域名，机构、业绩与行业长窗口结果明确标记为背景资料，IntelAgent 禁止将其转写为当前催化或风险。
 - [改进] GitHub Actions 每日分析工作流补齐 TickFlow 数据源环境变量映射，并收敛 README 数据源稳定性说明到完整指南。
 - [修复] WebUI 启动时显式 `--host` / `--port` 不再被 `.env` 中的 `WEBUI_HOST` / `WEBUI_PORT` 覆盖，未传 CLI 参数时统一使用解析后的运行时配置。
 - [改进] GitHub Actions: 每日分析工作流（`00-daily-analysis.yml`）新增钉钉通知环境变量映射，支持在云端定时任务中直接使用钉钉机器人。

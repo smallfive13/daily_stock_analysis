@@ -133,7 +133,7 @@ class TestTavilySearchProvider(unittest.TestCase):
                     {
                         "results": [
                             {
-                                "title": f"Fresh article via {field_name}",
+                                "title": f"阿里巴巴 BABA fresh article via {field_name}",
                                 "url": "https://example.com/fresh-article",
                                 "content": "Fresh coverage",
                                 field_name: published_text,
@@ -152,7 +152,38 @@ class TestTavilySearchProvider(unittest.TestCase):
                 self.assertTrue(resp.success)
                 self.assertEqual(len(resp.results), 1)
                 self.assertEqual(resp.results[0].published_date, expected_date)
-                self.assertEqual(_FakeTavilyClient.search_calls[0]["topic"], "news")
+                search_call = _FakeTavilyClient.search_calls[0]
+                self.assertEqual(search_call["topic"], "news")
+                self.assertIn("start_date", search_call)
+                self.assertIn("end_date", search_call)
+                self.assertNotIn("days", search_call)
+
+    def test_a_share_stock_news_limits_tavily_to_financial_domains(self) -> None:
+        published_text = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._patch_tavily(
+            {
+                "results": [
+                    {
+                        "title": "长电科技 600584 发布公告",
+                        "url": "https://www.cls.cn/detail/123",
+                        "content": "长电科技披露最新公告。",
+                        "published_date": published_text,
+                    }
+                ]
+            }
+        ):
+            service = SearchService(
+                tavily_keys=["dummy_key"],
+                searxng_public_instances_enabled=False,
+            )
+            response = service.search_stock_news("600584", "长电科技", max_results=1)
+
+        self.assertEqual(len(response.results), 1)
+        search_call = _FakeTavilyClient.search_calls[0]
+        self.assertEqual(
+            search_call["include_domains"],
+            list(service.A_SHARE_FINANCIAL_NEWS_DOMAINS),
+        )
 
     def test_search_stock_events_does_not_force_news_topic(self) -> None:
         with self._patch_tavily(
@@ -206,7 +237,7 @@ class TestTavilySearchProvider(unittest.TestCase):
         self.assertEqual(_FakeTavilyClient.search_calls[0]["topic"], "news")
         self.assertNotIn("topic", _FakeTavilyClient.search_calls[1])
 
-    def test_search_comprehensive_intel_etf_risk_check_does_not_force_news_topic(self) -> None:
+    def test_search_comprehensive_intel_etf_risk_check_uses_news_topic(self) -> None:
         published_dt = datetime.now(timezone.utc).replace(microsecond=0)
         published_text = published_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -236,7 +267,7 @@ class TestTavilySearchProvider(unittest.TestCase):
         self.assertGreaterEqual(len(_FakeTavilyClient.search_calls), 3)
         self.assertEqual(_FakeTavilyClient.search_calls[0]["topic"], "news")
         self.assertNotIn("topic", _FakeTavilyClient.search_calls[1])
-        self.assertNotIn("topic", _FakeTavilyClient.search_calls[2])
+        self.assertEqual(_FakeTavilyClient.search_calls[2]["topic"], "news")
 
     def test_search_comprehensive_intel_non_etf_risk_check_stays_in_news_topic(self) -> None:
         published_dt = datetime.now(timezone.utc).replace(microsecond=0)

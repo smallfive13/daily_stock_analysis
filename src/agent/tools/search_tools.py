@@ -13,6 +13,8 @@ from src.agent.tools.registry import ToolParameter, ToolDefinition, ToolPolicy
 
 logger = logging.getLogger(__name__)
 
+_BACKGROUND_INTEL_DIMENSIONS = {"market_analysis", "earnings", "industry"}
+
 _NEWS_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["network_read", "db_write_cache"],
@@ -180,12 +182,19 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
             )
             dimensions[dim_name] = {
                 "query": response.query,
+                "information_scope": (
+                    "background"
+                    if dim_name in _BACKGROUND_INTEL_DIMENSIONS
+                    else "current"
+                ),
                 "results_count": len(response.results),
                 "results": [
                     {
                         "title": r.title,
                         "snippet": r.snippet,
                         "source": r.source,
+                        "published_date": r.published_date,
+                        "url": r.url,
                     }
                     for r in response.results[:3]  # limit to 3 per dimension to save tokens
                 ],
@@ -201,7 +210,8 @@ search_comprehensive_intel_tool = ToolDefinition(
     name="search_comprehensive_intel",
     description="Multi-dimensional intelligence search: latest news, market analysis, "
                 "risk checking, earnings outlook, and industry trends for a stock. "
-                "Returns a formatted report and structured results.",
+                "Current news/risk items require a date and direct stock match; analytical "
+                "items are marked as background. Returns a formatted report and structured results.",
     parameters=[
         ToolParameter(
             name="stock_code",

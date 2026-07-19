@@ -375,13 +375,15 @@ daily_stock_analysis/
 - `sector_related_news`：命中行业板块语义；
 - `macro_market_news`：未命中目标主体时的宏观/市场语境新闻。
 
-排序策略为：先按类别优先级（direct > sector > macro）排序，再按语言偏好（中文优先）再按分数排序，因此当同一时窗内存在明确标的命中的新闻时会优先展示。
+排序策略为：先按类别优先级（direct > sector > macro）排序，再按语言偏好（中文优先）再按分数排序。`sector_related_news` 与 `macro_market_news` 仍用于候选诊断和相关度解释，但 `search_stock_news` 以及综合情报的最新消息、风险排查、公司公告只准入 `direct_company_news`，即结果必须在标题、摘要或链接中直接命中股票名或代码。
 
-排序后还会执行一层域名无关的准入过滤：明显的下载/安装包/应用评分页、成人/招嫖服务垃圾页会被剔除；当同一批次已经存在直接标的或有分数的行业/市场候选时，`score=0` 的背景填充项不会进入 `news_context`、Agent 工具输出或历史情报缓存。该规则不内置具体网站黑名单，避免靠穷举域名维护。
+排序后还会执行质量与时效准入：明显的下载/安装包/应用评分页、成人/招嫖服务垃圾页、静态行情/百科页，以及东方财富股吧、财富号等用户内容会被剔除；最新消息、风险排查、公司公告还必须提供可解析发布日期并落在 `NEWS_STRATEGY_PROFILE` 与 `NEWS_MAX_AGE_DAYS` 的有效窗口内。Tavily 请求使用明确的 `start_date` / `end_date`，A 股严格维度通过 `include_domains` 限定 `cls.cn`、`eastmoney.com`、`10jqka.com.cn`、`cninfo.com.cn`、`sse.com.cn`、`szse.cn`。
+
+综合情报不再把维度轮流分配给不同搜索源。每个维度都从 Tavily 开始，过滤后无合格结果再尝试 SearXNG，最后才使用其余已配置搜索源。`market_analysis`、`earnings` 继续使用 180 天窗口并允许日期未知的相关资料，`industry` 也属于分析资料；这三类在格式化报告和 Agent 结构化结果中统一标记为“背景资料”，不得进入最新消息、风险或催化结论。
 
 调试入口：
 
-- 每条返回会保留 `relevance_score` / `relevance_category` / `relevance_reasons` 元数据，最终 `to_text()` 与情报上下文会附带对应「关联度」说明；
+- 每条返回会保留 `published_date`、`url`、`relevance_score` / `relevance_category` / `relevance_reasons` 元数据，Agent 综合情报结构还会附带 `information_scope=current|background`；
 - 搜索链路日志会输出 `[新闻相关度]` 统计，便于复盘为何该批次触发了 direct/sector/macro 分层。
 
 兼容与回退说明：该改动不新增/修改模型、provider、Base URL、LiteLLM route、配置清理或回写逻辑；若出现异常，只能通过回滚本次提交恢复旧排序行为，不涉及历史配置迁移。

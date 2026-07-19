@@ -142,7 +142,7 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
                 query=query,
                 results=[
                     SearchResult(
-                        title="fresh-news",
+                        title="贵州茅台 600519 fresh-news",
                         snippet="snippet",
                         url="https://example.com/fresh-news",
                         source="example.com",
@@ -182,7 +182,10 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
         self.assertEqual(len(responses), 4)
         for response in responses:
             self.assertTrue(response.success)
-            self.assertEqual([item.title for item in response.results], ["fresh-news"])
+            self.assertEqual(
+                [item.title for item in response.results],
+                ["贵州茅台 600519 fresh-news"],
+            )
 
     def test_search_stock_news_rechecks_cache_after_wait_before_provider_search(self):
         service = SearchService(
@@ -192,12 +195,12 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
         )
         search_days = service._effective_news_window_days()
         cache_key = service._cache_key(
-            "贵州茅台 600519 股票 最新消息|target=600519:贵州茅台|news_pref=zh",
+            "贵州茅台 600519 最新 新闻 公告 重大事件|target=600519:贵州茅台|news_pref=zh",
             3,
             search_days,
         )
         cached_response = SearchResponse(
-            query="贵州茅台 600519 股票 最新消息",
+            query="贵州茅台 600519 最新 新闻 公告 重大事件",
             results=[
                 SearchResult(
                     title="cached-after-wait",

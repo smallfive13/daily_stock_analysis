@@ -704,6 +704,16 @@ class TestDecisionAgentPostProcess(unittest.TestCase):
 class TestIntelAgentPostProcess(unittest.TestCase):
     """Test IntelAgent JSON parsing and context caching behaviour."""
 
+    def test_prompt_keeps_background_intel_out_of_current_events(self):
+        from src.agent.agents.intel_agent import IntelAgent
+
+        agent = IntelAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        prompt = agent.system_prompt(AgentContext(query="test", stock_code="600519"))
+
+        self.assertIn("information_scope=current", prompt)
+        self.assertIn("information_scope=background", prompt)
+        self.assertIn("Never present them as a new event", prompt)
+
     def test_repairs_json_and_caches_intel_context(self):
         from src.agent.agents.intel_agent import IntelAgent
 

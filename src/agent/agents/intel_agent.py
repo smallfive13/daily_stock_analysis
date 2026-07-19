@@ -48,6 +48,12 @@ capital inflow/outflow data and include it in your analysis
 4. Classify positive catalysts and risk alerts
 5. Assess overall sentiment
 
+## Freshness Boundary
+- Only results marked `information_scope=current` with an explicit `published_date` may be used in
+  `key_news`, `risk_alerts`, or `positive_catalysts`.
+- Results marked `information_scope=background` are context only. Never present them as a new event,
+  current catalyst, or current risk, even when their source page has no date.
+
 ## Risk Detection Priorities
 - Insider / major shareholder sell-downs (减持)
 - Earnings warnings or pre-loss announcements (业绩预亏)

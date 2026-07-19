@@ -306,6 +306,10 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int,
         days: int = 7,
         topic: Optional[str] = None,
+        time_range: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_domains: Optional[List[str]] = None,
     ) -> SearchResponse:
         """执行 Tavily 搜索"""
         try:
@@ -329,10 +333,22 @@ class TavilySearchProvider(BaseSearchProvider):
                 "max_results": max_results,
                 "include_answer": False,
                 "include_raw_content": False,
-                "days": days,  # 搜索最近天数的内容
             }
+            # Explicit date bounds are stronger than the legacy ``days`` hint
+            # and work for both news and general/finance searches.
+            if start_date or end_date or time_range:
+                if time_range is not None:
+                    search_kwargs["time_range"] = time_range
+                if start_date is not None:
+                    search_kwargs["start_date"] = start_date
+                if end_date is not None:
+                    search_kwargs["end_date"] = end_date
+            else:
+                search_kwargs["days"] = days
             if topic is not None:
                 search_kwargs["topic"] = topic
+            if include_domains:
+                search_kwargs["include_domains"] = list(include_domains)
 
             response = client.search(
                 **search_kwargs,
@@ -380,46 +396,22 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int = 5,
         days: int = 7,
         topic: Optional[str] = None,
+        time_range: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_domains: Optional[List[str]] = None,
     ) -> SearchResponse:
         """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
-        if topic is None:
-            return super().search(query, max_results=max_results, days=days)
-
-        api_key = self._get_next_key()
-        if not api_key:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=f"{self._name} 未配置 API Key"
-            )
-
-        start_time = time.time()
-        try:
-            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
-            response.search_time = time.time() - start_time
-
-            if response.success:
-                self._record_success(api_key)
-                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
-            else:
-                self._record_error(api_key)
-
-            return response
-
-        except Exception as e:
-            self._record_error(api_key)
-            elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=str(e),
-                search_time=elapsed
-            )
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            topic=topic,
+            time_range=time_range,
+            start_date=start_date,
+            end_date=end_date,
+            include_domains=include_domains,
+        )
     
     @staticmethod
     def _extract_domain(url: str) -> str:
@@ -2129,6 +2121,14 @@ class SearchService:
     FUTURE_TOLERANCE_DAYS = 1
     ANALYTICAL_INTEL_LOOKBACK_DAYS = 180
     ANALYTICAL_INTEL_DIMENSIONS = {"market_analysis", "earnings"}
+    A_SHARE_FINANCIAL_NEWS_DOMAINS = (
+        "cls.cn",
+        "eastmoney.com",
+        "10jqka.com.cn",
+        "cninfo.com.cn",
+        "sse.com.cn",
+        "szse.cn",
+    )
     _CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
     _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
     _DIRECT_NEWS_CATEGORY = "direct_company_news"
@@ -2172,6 +2172,15 @@ class SearchService:
         "cninfo", "hkexnews", "巨潮资讯", "巨潮资讯网",
         "上交所", "深交所", "港交所", "证券交易所",
         "上海证券交易所", "深圳证券交易所", "香港交易所", "香港联合交易所",
+    )
+    _NON_NEWS_CURRENT_PAGE_TERMS = (
+        "盘口异动_行情_走势图",
+        "行情_走势图",
+        "实时行情",
+        "历史行情",
+        "行情中心",
+        "股票行情",
+        "百度百科",
     )
     _LOW_QUALITY_DOWNLOAD_ACTION_TERMS = (
         "下载", "安装", "下载安装", "下载安装到手机", "下载链接",
@@ -2578,6 +2587,41 @@ class SearchService:
             news_strategy_profile=self.news_strategy_profile,
         )
 
+    @staticmethod
+    def _explicit_search_date_bounds(search_days: int) -> Tuple[str, str]:
+        """Build Tavily's exclusive date bounds for an inclusive local window."""
+        today = datetime.now().date()
+        days = max(1, int(search_days))
+        return (
+            (today - timedelta(days=days)).isoformat(),
+            (today + timedelta(days=1)).isoformat(),
+        )
+
+    @staticmethod
+    def _is_a_share_stock(stock_code: str) -> bool:
+        code = (stock_code or "").strip().upper()
+        if "." in code:
+            base, suffix = code.rsplit(".", 1)
+            return bool(base.isdigit() and len(base) == 6 and suffix in {"SH", "SS", "SZ", "BJ"})
+        return bool(code.isdigit() and len(code) == 6)
+
+    def _ordered_intel_providers(self) -> List[BaseSearchProvider]:
+        """Prefer Tavily then SearXNG for every intel dimension."""
+        available = [provider for provider in self._providers if provider.is_available]
+
+        def provider_rank(provider: BaseSearchProvider) -> int:
+            if isinstance(provider, TavilySearchProvider):
+                return 0
+            if isinstance(provider, SearXNGSearchProvider):
+                return 1
+            return 2
+
+        ordered = sorted(
+            enumerate(available),
+            key=lambda item: (provider_rank(item[1]), item[0]),
+        )
+        return [provider for _, provider in ordered]
+
     @classmethod
     def _provider_request_size(cls, max_results: int) -> int:
         """Apply light overfetch before time filtering to avoid sparse outputs."""
@@ -2792,6 +2836,22 @@ class SearchService:
             )
 
         return source_label in cls._OFFICIAL_SOURCE_LABELS
+
+    @classmethod
+    def _has_non_news_current_page_signal(cls, item: SearchResult) -> bool:
+        """Identify static quote/reference and user-generated pages unsuitable as current news."""
+        host = cls._candidate_hostname(item.url) or cls._candidate_hostname(item.source)
+        if host == "baike.baidu.com":
+            return True
+        if host == "quote.eastmoney.com" or host.endswith(".quote.eastmoney.com"):
+            return True
+        if host == "eastmoney.com" or host.endswith(".eastmoney.com"):
+            subdomain = host[: -len(".eastmoney.com")].split(".")[-1]
+            if subdomain in {"guba", "gubapost", "mguba", "gubaf10", "caifuhao"}:
+                return True
+
+        content_text = " ".join(filter(None, [item.title, item.snippet]))
+        return cls._contains_any_news_term(content_text, cls._NON_NEWS_CURRENT_PAGE_TERMS)
 
     @classmethod
     def _has_low_quality_news_page_signal(cls, item: SearchResult) -> bool:
@@ -3144,8 +3204,10 @@ class SearchService:
         response: SearchResponse,
         *,
         log_scope: str,
+        require_direct_company: bool = False,
+        require_current_news_page: bool = False,
     ) -> SearchResponse:
-        """Drop obvious non-news pages and zero-relevance fillers from ranked results."""
+        """Drop low-quality fillers and optionally require a direct stock identity hit."""
         if not response.success or not response.results:
             return response
 
@@ -3153,6 +3215,7 @@ class SearchService:
         dropped_low_quality = 0
         dropped_adult_spam = 0
         dropped_zero_relevance = 0
+        dropped_non_news_page = 0
 
         for item in response.results:
             is_official_source = cls._is_trusted_official_news_source(item)
@@ -3168,24 +3231,42 @@ class SearchService:
             ):
                 dropped_adult_spam += 1
                 continue
+            if require_current_news_page and cls._has_non_news_current_page_signal(item):
+                dropped_non_news_page += 1
+                continue
             candidates.append(item)
 
-        meaningful_candidates = [
-            item
-            for item in candidates
-            if item.relevance_category == cls._DIRECT_NEWS_CATEGORY
-            or (item.relevance_score or 0) > 0
-        ]
-        if meaningful_candidates:
+        if require_direct_company:
+            meaningful_candidates = [
+                item
+                for item in candidates
+                if item.relevance_category == cls._DIRECT_NEWS_CATEGORY
+            ]
             dropped_zero_relevance = len(candidates) - len(meaningful_candidates)
             filtered_results = meaningful_candidates
         else:
+            meaningful_candidates = [
+                item
+                for item in candidates
+                if item.relevance_category == cls._DIRECT_NEWS_CATEGORY
+                or (item.relevance_score or 0) > 0
+            ]
+        if not require_direct_company and meaningful_candidates:
+            dropped_zero_relevance = len(candidates) - len(meaningful_candidates)
+            filtered_results = meaningful_candidates
+        elif not require_direct_company:
             filtered_results = candidates
 
-        if dropped_low_quality or dropped_adult_spam or dropped_zero_relevance:
+        if (
+            dropped_low_quality
+            or dropped_adult_spam
+            or dropped_zero_relevance
+            or dropped_non_news_page
+        ):
             logger.info(
                 "[新闻准入] %s: provider=%s, total=%s, kept=%s, "
-                "drop_low_quality=%s, drop_adult_spam=%s, drop_zero_relevance=%s",
+                "drop_low_quality=%s, drop_adult_spam=%s, drop_zero_relevance=%s, "
+                "drop_non_news_page=%s",
                 log_scope,
                 response.provider,
                 len(response.results),
@@ -3193,6 +3274,7 @@ class SearchService:
                 dropped_low_quality,
                 dropped_adult_spam,
                 dropped_zero_relevance,
+                dropped_non_news_page,
             )
 
         return SearchResponse(
@@ -3609,13 +3691,13 @@ class SearchService:
             # 如果提供了关键词，直接使用关键词作为查询
             query = " ".join(focus_keywords)
         elif prefer_chinese:
-            query = f"{stock_name} {stock_code} 股票 最新消息"
+            query = f"{stock_name} {stock_code} 最新 新闻 公告 重大事件"
         elif is_foreign:
             # 港股/美股使用英文搜索关键词
             query = f"{stock_name} {stock_code} stock latest news"
         else:
             # 默认主查询：股票名称 + 核心关键词
-            query = f"{stock_name} {stock_code} 股票 最新消息"
+            query = f"{stock_name} {stock_code} 最新 新闻 公告 重大事件"
 
         logger.info(
             (
@@ -3694,7 +3776,16 @@ class SearchService:
 
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
-                    search_kwargs["topic"] = "news"
+                    start_date, end_date = self._explicit_search_date_bounds(search_days)
+                    search_kwargs.update(
+                        {
+                            "topic": "news",
+                            "start_date": start_date,
+                            "end_date": end_date,
+                        }
+                    )
+                    if self._is_a_share_stock(stock_code):
+                        search_kwargs["include_domains"] = self.A_SHARE_FINANCIAL_NEWS_DOMAINS
                 elif isinstance(provider, BraveSearchProvider):
                     search_kwargs.update(
                         self._brave_search_locale(
@@ -3745,6 +3836,8 @@ class SearchService:
                     admitted_response = self._filter_ranked_news_for_context(
                         ranked_response,
                         log_scope=f"{stock_code}:{provider.name}:stock_news",
+                        require_direct_company=True,
+                        require_current_news_page=True,
                     )
                     limited_response = self._limit_search_response(
                         admitted_response,
@@ -3971,8 +4064,8 @@ class SearchService:
                         if is_index_etf else f"{stock_name} risk insider selling lawsuit litigation"
                     ),
                     'desc': '风险排查',
-                    'tavily_topic': None if is_index_etf else 'news',
-                    'strict_freshness': not is_index_etf,
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
                 },
                 {
                     'name': 'earnings',
@@ -4018,8 +4111,8 @@ class SearchService:
                         if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
                     ),
                     'desc': '风险排查',
-                    'tavily_topic': None if is_index_etf else 'news',
-                    'strict_freshness': not is_index_etf,
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
                 },
                 {
                     'name': 'announcements',
@@ -4071,97 +4164,138 @@ class SearchService:
             provider_max_results,
         )
         
-        # 轮流使用不同的搜索引擎
-        provider_index = 0
-        
+        available_providers = self._ordered_intel_providers()
+
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
-            
-            # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
-            
-            provider = available_providers[provider_index % len(available_providers)]
-            provider_index += 1
-            
+
             request_days = (
                 self.ANALYTICAL_INTEL_LOOKBACK_DAYS
                 if dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS
                 else search_days
             )
+            require_direct_company = (
+                dim['strict_freshness']
+                or dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS
+            )
+            selected_response: Optional[SearchResponse] = None
+            had_provider_success = False
 
-            logger.info(
-                "[情报搜索] %s: 使用 %s，请求窗口: 近%s天",
-                dim['desc'],
-                provider.name,
-                request_days,
-            )
-
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                    topic=dim['tavily_topic'],
-                )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                )
-            if dim['strict_freshness']:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=search_days,
-                    max_results=provider_max_results,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
-                    max_results=provider_max_results,
-                    keep_unknown=True,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            else:
-                filtered_response = self._normalize_and_limit_response(
-                    response,
-                    max_results=provider_max_results,
-                )
-            filtered_response = self._rank_news_response(
-                filtered_response,
-                stock_code=stock_code,
-                stock_name=stock_name,
-                prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
-                max_results=provider_max_results,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
-            )
-            filtered_response = self._filter_ranked_news_for_context(
-                filtered_response,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
-            )
-            filtered_response = self._limit_search_response(
-                filtered_response,
-                max_results=target_per_dimension,
-            )
-            results[dim['name']] = filtered_response
-            search_count += 1
-            
-            if response.success:
+            for provider in available_providers:
                 logger.info(
-                    "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
+                    "[情报搜索] %s: 尝试 %s，请求窗口: 近%s天",
                     dim['desc'],
-                    len(response.results),
-                    len(filtered_response.results),
+                    provider.name,
+                    request_days,
                 )
-            else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
-            
-            # 短暂延迟避免请求过快
+
+                search_kwargs: Dict[str, Any] = {}
+                if isinstance(provider, TavilySearchProvider):
+                    start_date, end_date = self._explicit_search_date_bounds(request_days)
+                    search_kwargs.update(
+                        {
+                            "start_date": start_date,
+                            "end_date": end_date,
+                        }
+                    )
+                    if dim.get('tavily_topic'):
+                        search_kwargs["topic"] = dim['tavily_topic']
+                    if dim['strict_freshness'] and self._is_a_share_stock(stock_code):
+                        search_kwargs["include_domains"] = self.A_SHARE_FINANCIAL_NEWS_DOMAINS
+                elif isinstance(provider, BraveSearchProvider):
+                    search_kwargs.update(
+                        self._brave_search_locale(
+                            stock_code,
+                            prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
+                        )
+                    )
+
+                response = provider.search(
+                    dim['query'],
+                    max_results=provider_max_results,
+                    days=request_days,
+                    **search_kwargs,
+                )
+                had_provider_success = had_provider_success or bool(response.success)
+
+                if dim['strict_freshness']:
+                    filtered_response = self._filter_news_response(
+                        response,
+                        search_days=search_days,
+                        max_results=provider_max_results,
+                        log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    )
+                elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
+                    filtered_response = self._filter_news_response(
+                        response,
+                        search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
+                        max_results=provider_max_results,
+                        keep_unknown=True,
+                        log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    )
+                else:
+                    filtered_response = self._normalize_and_limit_response(
+                        response,
+                        max_results=provider_max_results,
+                    )
+                filtered_response = self._rank_news_response(
+                    filtered_response,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
+                    max_results=provider_max_results,
+                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
+                )
+                filtered_response = self._filter_ranked_news_for_context(
+                    filtered_response,
+                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
+                    require_direct_company=require_direct_company,
+                    require_current_news_page=dim['strict_freshness'],
+                )
+                filtered_response = self._limit_search_response(
+                    filtered_response,
+                    max_results=target_per_dimension,
+                )
+
+                if filtered_response.success and filtered_response.results:
+                    selected_response = filtered_response
+                    logger.info(
+                        "[情报搜索] %s: %s 返回 %s 条合格结果",
+                        dim['desc'],
+                        provider.name,
+                        len(filtered_response.results),
+                    )
+                    break
+
+                selected_response = filtered_response
+                logger.info(
+                    "[情报搜索] %s: %s 过滤后无合格结果，尝试下一引擎",
+                    dim['desc'],
+                    provider.name,
+                )
+
+            if selected_response is None:
+                selected_response = SearchResponse(
+                    query=dim['query'],
+                    results=[],
+                    provider="None",
+                    success=False,
+                    error_message="没有可用搜索引擎",
+                )
+            elif had_provider_success and not selected_response.results:
+                selected_response = SearchResponse(
+                    query=dim['query'],
+                    results=[],
+                    provider="Filtered",
+                    success=True,
+                )
+
+            results[dim['name']] = selected_response
+            search_count += 1
+
             time.sleep(0.5)
         
         return results
@@ -4177,7 +4311,11 @@ class SearchService:
         Returns:
             格式化的情报报告文本
         """
-        lines = [f"【{stock_name} 情报搜索结果】"]
+        lines = [
+            f"【{stock_name} 情报搜索结果】",
+            "口径说明：最新消息/公告/风险仅含有明确发布日期且直接命中标的的结果；"
+            "机构、业绩与行业内容属于背景资料，不得作为最新催化或风险使用。",
+        ]
         
         # 维度展示顺序
         display_order = ['latest_news', 'announcements', 'market_analysis', 'risk_check', 'earnings', 'industry']
@@ -4185,10 +4323,10 @@ class SearchService:
         dim_labels = {
             'latest_news': '📰 最新消息',
             'announcements': '📋 公司公告',
-            'market_analysis': '📈 机构分析',
+            'market_analysis': '📚 背景资料｜机构分析',
             'risk_check': '⚠️ 风险排查',
-            'earnings': '📊 业绩预期',
-            'industry': '🏭 行业分析',
+            'earnings': '📚 背景资料｜业绩资料',
+            'industry': '📚 背景资料｜行业分析',
         }
 
         for dim_name in display_order:

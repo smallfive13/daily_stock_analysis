@@ -71,6 +71,10 @@ class SearchToolsPersistenceTest(unittest.TestCase):
 
         self.assertEqual(result["report"], "report")
         self.assertEqual(list(result["dimensions"].keys()), ["latest_news"])
+        latest_payload = result["dimensions"]["latest_news"]
+        self.assertEqual(latest_payload["information_scope"], "current")
+        self.assertEqual(latest_payload["results"][0]["published_date"], "2026-04-24")
+        self.assertEqual(latest_payload["results"][0]["url"], "https://example.com/news")
         db.save_news_intel.assert_called_once_with(
             code="600519",
             name="贵州茅台",
@@ -94,6 +98,25 @@ class SearchToolsPersistenceTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["results_count"], 1)
+
+    def test_comprehensive_intel_marks_analytical_dimensions_as_background(self) -> None:
+        background = _response("market analysis")
+        service = SimpleNamespace(
+            is_available=True,
+            search_comprehensive_intel=MagicMock(
+                return_value={"market_analysis": background}
+            ),
+            format_intel_report=MagicMock(return_value="report"),
+        )
+        db = SimpleNamespace(save_news_intel=MagicMock(return_value=1))
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db):
+            result = _handle_search_comprehensive_intel("600519", "贵州茅台")
+
+        payload = result["dimensions"]["market_analysis"]
+        self.assertEqual(payload["information_scope"], "background")
+        self.assertEqual(payload["results"][0]["published_date"], "2026-04-24")
 
     def test_unavailable_or_failed_search_does_not_persist(self) -> None:
         unavailable = SimpleNamespace(is_available=False)
