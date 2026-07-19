@@ -1177,3 +1177,73 @@ def test_daily_market_context_keeps_jp_kr_regions_and_labels() -> None:
 
     assert "市场：日股（jp）" in jp_section
     assert "Region: Korea (kr)" in kr_section
+
+
+def test_daily_market_context_carries_bounded_a_share_evidence_and_guardrails() -> None:
+    service = DailyMarketContextService(
+        db_manager=MagicMock(),
+        today_fn=lambda: date(2026, 7, 17),
+    )
+    context = service._build_context_from_payload(
+        region="cn",
+        trade_date=date(2026, 7, 17),
+        payload={
+            "summary": "市场结构分化，等待确认。",
+            "a_share_evidence": {
+                "sentiment_structure": {
+                    "limit_up_count": 60,
+                    "broken_board_count": 35,
+                    "broken_ratio": 0.3684,
+                    "limit_down_count": 8,
+                    "previous_limit_premium_median_pct": -0.6,
+                    "highest_consecutive_board": 4,
+                    "one_price_like_ratio": 0.2,
+                    "multi_board_ladder": [{"code": "secret-not-forwarded"}],
+                },
+                "theme_candidates": [
+                    {
+                        "theme": f"主题{i}",
+                        "classification": "mainline_candidate",
+                        "total_score": 70 - i,
+                        "confirmation": "前排承接",
+                        "invalidation": "前排断板",
+                        "internal": "not-forwarded",
+                    }
+                    for i in range(5)
+                ],
+                "stock_candidates": [
+                    {
+                        "category": "capacity_core",
+                        "code": f"60000{i}",
+                        "name": f"候选{i}",
+                        "themes": ["半导体"],
+                        "validation": "板块共振",
+                        "invalidation": "跌破承接位",
+                        "risk_tags": ["not-forwarded"],
+                    }
+                    for i in range(8)
+                ],
+                "risk_tags": [
+                    "high_broken_board_ratio",
+                    "negative_previous_limit_premium",
+                ],
+            },
+        },
+        source="analysis_history",
+    )
+
+    assert context is not None
+    safe_payload = context.to_safe_dict()
+    assert len(safe_payload["theme_candidates"]) == 3
+    assert len(safe_payload["stock_candidates"]) == 5
+    assert "multi_board_ladder" not in safe_payload["sentiment_structure"]
+    assert "high_risk" in safe_payload["risk_tags"]
+    assert "market_cooling" in safe_payload["risk_tags"]
+    assert "internal" not in safe_payload["theme_candidates"][0]
+    assert "risk_tags" not in safe_payload["stock_candidates"][0]
+
+    section = format_daily_market_context_prompt_section(safe_payload, report_language="zh")
+    assert "炸板率 36.8%" in section
+    assert "题材候选" in section
+    assert "候选0" in section
+    assert section.index("候选0") < section.index("END_UNTRUSTED_MARKET_SUMMARY")

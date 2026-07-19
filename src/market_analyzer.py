@@ -21,6 +21,7 @@ from typing import Optional, Dict, Any, List
 import pandas as pd
 
 from src.config import get_config
+from src.core.trading_calendar import get_effective_trading_date
 from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
@@ -33,6 +34,11 @@ from src.llm.generation_backend import GenerationError
 from src.schemas.market_light import MARKET_LIGHT_REGIONS, MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 from src.services.intelligence_service import IntelligenceService
+from src.services.a_share_review_evidence import (
+    AShareReviewEvidenceService,
+    aggregate_limit_up_pool as _aggregate_limit_up_pool,
+    compute_index_key_levels as _compute_index_key_levels,
+)
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
@@ -51,11 +57,11 @@ _ENGLISH_SECTION_PATTERNS = {
 }
 
 _CHINESE_SECTION_PATTERNS = {
-    "market_summary": r"###\s*一、(?:盘面总览|市场总结)",
-    "index_commentary": r"###\s*二、(?:指数结构|指数点评|主要指数)",
-    "sector_highlights": r"###\s*三、(?:板块主线|热点解读|板块表现)",
-    "funds_sentiment": r"###\s*四、(?:资金与情绪|资金动向)",
-    "news_catalysts": r"###\s*五、(?:消息催化|后市展望)",
+    "market_summary": r"###\s*(?:[一二三四五六七八九十]+、)?(?:盘面总览|市场总结)",
+    "index_commentary": r"###\s*(?:[一二三四五六七八九十]+、)?(?:指数结构|指数点评|主要指数|大盘风险门槛)",
+    "sector_highlights": r"###\s*(?:[一二三四五六七八九十]+、)?(?:板块主线|热点解读|板块表现|热点排序)",
+    "funds_sentiment": r"###\s*(?:[一二三四五六七八九十]+、)?(?:资金与情绪|资金动向|情绪温度)",
+    "news_catalysts": r"###\s*(?:[一二三四五六七八九十]+、)?(?:消息催化|后市展望)",
 }
 
 
@@ -94,7 +100,12 @@ class MarketIndex:
 @dataclass
 class MarketOverview:
     """市场概览数据"""
-    date: str                           # 日期
+    date: str                           # 数据交易日/报告交易日
+    generated_at: str = ""              # 报告生成时间
+    run_date: str = ""                  # 运行自然日
+    data_date: str = ""                 # 实际行情数据日期
+    data_scope_note: str = ""           # 日期/数据口径说明
+    is_non_trading_run: bool = False    # 是否为非交易日/盘外复盘
     indices: List[MarketIndex] = field(default_factory=list)  # 主要指数
     up_count: int = 0                   # 上涨家数
     down_count: int = 0                 # 下跌家数
@@ -118,6 +129,11 @@ class MarketOverview:
     fund_outflow_sectors: List[Dict] = field(default_factory=list)
     limit_up_structure: Dict = field(default_factory=dict)
     index_key_levels: List[Dict] = field(default_factory=list)
+    a_share_evidence: Dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.data_date:
+            self.data_date = self.date
 
 
 @dataclass
@@ -132,66 +148,12 @@ class MarketLightReviewResult:
 
 def aggregate_limit_up_pool(rows: List[Dict]) -> Dict[str, Any]:
     """Aggregate limit-up pool rows for market-review prompt input."""
-    if not rows:
-        return {}
-
-    industry_counts: Dict[str, int] = {}
-    max_consecutive_boards = 0
-    max_boards_stock = ""
-    total_break_count = 0
-
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        industry = str(row.get("industry") or "").strip()
-        if industry:
-            industry_counts[industry] = industry_counts.get(industry, 0) + 1
-
-        try:
-            boards = int(float(row.get("consecutive_boards") or 0))
-        except (TypeError, ValueError):
-            boards = 0
-        if boards > max_consecutive_boards:
-            max_consecutive_boards = boards
-            max_boards_stock = str(row.get("name") or "").strip()
-
-        try:
-            total_break_count += int(float(row.get("break_count") or 0))
-        except (TypeError, ValueError):
-            continue
-
-    industry_distribution = [
-        {"industry": industry, "count": count}
-        for industry, count in sorted(industry_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
-    ]
-    return {
-        "total": len(rows),
-        "industry_distribution": industry_distribution,
-        "max_consecutive_boards": max_consecutive_boards,
-        "max_boards_stock": max_boards_stock,
-        "total_break_count": total_break_count,
-    }
+    return _aggregate_limit_up_pool(rows)
 
 
 def compute_index_key_levels(bars: List[Dict]) -> Dict[str, Any]:
-    """Compute MA20 and recent 20-day high/low from ascending daily bars."""
-    if not bars or len(bars) < 20:
-        return {}
-
-    recent_bars = bars[-20:]
-    try:
-        closes = [float(bar["close"]) for bar in recent_bars]
-        highs = [float(bar["high"]) for bar in recent_bars]
-        lows = [float(bar["low"]) for bar in recent_bars]
-    except (KeyError, TypeError, ValueError):
-        return {}
-    if not closes or not highs or not lows:
-        return {}
-    return {
-        "ma20": round(sum(closes) / len(closes), 2),
-        "high_20d": round(max(highs), 2),
-        "low_20d": round(min(lows), 2),
-    }
+    """Compatibility wrapper for the shared MA5/MA10/MA20 calculation."""
+    return _compute_index_key_levels(bars)
 
 
 class MarketAnalyzer:
@@ -509,8 +471,37 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         Returns:
             MarketOverview: 市场概览数据对象
         """
-        today = datetime.now().strftime('%Y-%m-%d')
-        overview = MarketOverview(date=today)
+        now = datetime.now()
+        run_date = now.strftime('%Y-%m-%d')
+        try:
+            data_date = get_effective_trading_date(self.region, current_time=now).isoformat()
+        except Exception as exc:
+            logger.warning(
+                "[大盘] %s action=resolve_data_date status=failed error=%s",
+                self._log_context(),
+                exc,
+            )
+            data_date = run_date
+
+        is_non_trading_run = data_date != run_date
+        if is_non_trading_run:
+            data_scope_note = (
+                f"本次复盘生成于 {run_date}，该自然日不是可复用的完整交易日；"
+                f"报告中的“今日”指 {data_date} 的最新完整交易日数据，“明日/次日”指该交易日之后的下一交易日。"
+            )
+        else:
+            data_scope_note = (
+                f"本次复盘生成于 {run_date}，报告数据口径按 {data_date} 交易日处理。"
+            )
+
+        overview = MarketOverview(
+            date=data_date,
+            generated_at=now.isoformat(timespec="seconds"),
+            run_date=run_date,
+            data_date=data_date,
+            data_scope_note=data_scope_note,
+            is_non_trading_run=is_non_trading_run,
+        )
         
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
         overview.indices = self._get_main_indices()
@@ -518,7 +509,6 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 2. 获取涨跌统计（A 股有，美股无等效数据）
         if self.profile.has_market_stats:
             self._get_market_statistics(overview)
-            self._get_limit_up_structure(overview)
 
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
@@ -530,9 +520,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if self.profile.has_global_context:
             self._get_global_indices(overview)
 
-        # 5. 获取指数关键位参考（仅 A 股复盘，fail-open）
+        # 5. 构建 A 股复盘证据（日期化情绪池、指数均线、题材与观察票，fail-open）
         if self.region == "cn":
-            self._get_index_key_levels(overview)
+            self._get_a_share_review_evidence(overview)
 
         # 6. 获取北向资金（可选）
         # self._get_north_flow(overview)
@@ -681,6 +671,59 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.warning("[大盘] %s action=get_sector_fund_flow_rankings status=failed error=%s", self._log_context(), e)
+
+    def _get_a_share_review_evidence(self, overview: MarketOverview) -> None:
+        """Build one structured A-share evidence snapshot and legacy compatibility fields."""
+        try:
+            logger.info("[大盘] %s action=get_a_share_review_evidence status=start", self._log_context())
+            service = AShareReviewEvidenceService(self.data_manager)
+            evidence = service.build(
+                trade_date=(overview.data_date or overview.date).replace("-", ""),
+                indices=overview.indices,
+                sector_rankings={"top": overview.top_sectors, "bottom": overview.bottom_sectors},
+                concept_rankings={"top": overview.top_concepts, "bottom": overview.bottom_concepts},
+                market_snapshot={
+                    "up_count": overview.up_count,
+                    "down_count": overview.down_count,
+                    "flat_count": overview.flat_count,
+                    "total_amount": overview.total_amount,
+                },
+            )
+            overview.a_share_evidence = evidence
+
+            sentiment = evidence.get("sentiment_structure") if isinstance(evidence, dict) else None
+            quality = evidence.get("data_quality") if isinstance(evidence, dict) else None
+            missing_fields = quality.get("missing_fields") if isinstance(quality, dict) else []
+            if isinstance(sentiment, dict) and "limit_up_pool" not in (missing_fields or []):
+                overview.limit_up_structure = {
+                    "total": int(sentiment.get("limit_up_count") or 0),
+                    "industry_distribution": list(sentiment.get("industry_distribution") or []),
+                    "max_consecutive_boards": int(sentiment.get("highest_consecutive_board") or 0),
+                    "max_boards_stock": str(sentiment.get("highest_board_stock") or ""),
+                    "total_break_count": int(sentiment.get("total_break_count") or 0),
+                }
+            else:
+                overview.limit_up_structure = {}
+
+            index_trend = evidence.get("index_trend") if isinstance(evidence, dict) else None
+            if isinstance(index_trend, list):
+                overview.index_key_levels = [dict(item) for item in index_trend if isinstance(item, dict)]
+
+            logger.info(
+                "[大盘] %s action=get_a_share_review_evidence status=success evidence_status=%s themes=%d stocks=%d",
+                self._log_context(),
+                evidence.get("status") if isinstance(evidence, dict) else "unknown",
+                len(evidence.get("theme_candidates") or []) if isinstance(evidence, dict) else 0,
+                len(evidence.get("stock_candidates") or []) if isinstance(evidence, dict) else 0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[大盘] %s action=get_a_share_review_evidence status=failed error=%s",
+                self._log_context(),
+                exc,
+                exc_info=True,
+            )
+            overview.a_share_evidence = {}
 
     def _get_limit_up_structure(self, overview: MarketOverview):
         """获取涨停结构（fail-open）。"""
@@ -1057,8 +1100,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "region": self.region,
             "language": language,
             "title": title,
-            "generated_at": datetime.now().isoformat(),
+            "generated_at": overview.generated_at or datetime.now().isoformat(),
             "date": overview.date,
+            "run_date": overview.run_date or overview.date,
+            "data_date": overview.data_date or overview.date,
+            "is_non_trading_run": overview.is_non_trading_run,
+            "data_scope_note": overview.data_scope_note,
             "market_scope": self._get_market_scope_name(language),
             "indices": [idx.to_dict() for idx in overview.indices],
             "sectors": {
@@ -1087,6 +1134,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "total_amount": overview.total_amount,
                 "turnover_unit": self._get_turnover_unit_label(),
             }
+
+        if self.region == "cn":
+            payload["fund_flows"] = {
+                "inflow": list(overview.fund_inflow_sectors or []),
+                "outflow": list(overview.fund_outflow_sectors or []),
+            }
+            payload["limit_up_structure"] = dict(overview.limit_up_structure or {})
+            payload["index_key_levels"] = list(overview.index_key_levels or [])
+            payload["a_share_evidence"] = dict(overview.a_share_evidence or {})
 
         return payload
 
@@ -1157,6 +1213,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
     ) -> str:
         """Inject structured data tables into the corresponding LLM prose sections."""
         # Build data blocks
+        data_scope_block = self._build_data_scope_report_block(overview)
         stats_block = self._build_stats_block(overview)
         indices_block = self._build_indices_block(overview)
         sector_block = self._build_sector_block(overview)
@@ -1165,6 +1222,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             if self._get_review_language() == "en"
             else _CHINESE_SECTION_PATTERNS
         )
+
+        data_scope_pattern = (
+            r"###\s*(?:1\.\s*)?Data Scope"
+            if self._get_review_language() == "en"
+            else r"###\s*(?:[一二三四五六七八九十]+、)?数据口径"
+        )
+        if data_scope_block and not re.search(data_scope_pattern, review):
+            review = self._insert_after_report_title(review, data_scope_block)
 
         if stats_block:
             review = self._insert_after_section(
@@ -1198,6 +1263,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         return review
 
     @staticmethod
+    def _insert_after_report_title(text: str, block: str) -> str:
+        """Insert a block immediately after the first markdown report title."""
+        match = re.search(r"^##\s+.+?\s*$", text or "", flags=re.MULTILINE)
+        if not match:
+            return f"{block}\n\n{(text or '').lstrip()}".strip()
+        insert_pos = match.end()
+        return text[:insert_pos].rstrip() + "\n\n" + block + "\n\n" + text[insert_pos:].lstrip("\n")
+
+    @staticmethod
     def _insert_after_section(text: str, heading_pattern: str, block: str) -> str:
         """Insert a data block at the end of a markdown section (before the next ### heading)."""
         import re
@@ -1221,8 +1295,17 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         has_stats = overview.up_count or overview.down_count or overview.total_amount
         if not has_stats:
             return ""
+        has_limit_structure = bool(getattr(overview, "limit_up_structure", None))
         if self._get_review_language() == "en":
             light = self.build_market_light_snapshot(overview)
+            if has_limit_structure:
+                continuation_note = (
+                    "- **Sentiment data boundary**: limit-up pool, continuation height, break count, and industry distribution are provided separately when available; previous-limit-up premium, broken-board feedback, and one-tick board ratio remain unavailable."
+                )
+            else:
+                continuation_note = (
+                    "- **Data gap**: board-failure rate, continuation height, previous-limit-up premium, broken-board feedback, and one-tick board ratio are unavailable, so this measures heat rather than follow-through quality."
+                )
             return "\n".join(
                 [
                     f"- **Market Signal**: {light['score']}/100 "
@@ -1234,6 +1317,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     f"Flat {overview.flat_count}; "
                     f"Limit-up {overview.limit_up_count} / Limit-down {overview.limit_down_count}; "
                     f"Turnover {overview.total_amount:.0f} ({self._get_turnover_unit_label()})",
+                    "",
+                    continuation_note,
                 ]
             )
         light = self.build_market_light_snapshot(overview)
@@ -1241,6 +1326,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         participation = overview.up_count + overview.down_count
         up_ratio = overview.up_count / participation if participation else 0.0
         limit_spread = overview.limit_up_count - overview.limit_down_count
+        if has_limit_structure:
+            continuation_note = (
+                "- **情绪数据边界**：涨停池、最高连板、炸板次数和行业分布会在涨停结构中单独列示；当前仍未提供昨日涨停溢价、断板反馈和一字板比例。"
+            )
+        else:
+            continuation_note = (
+                "- **情绪数据边界**：当前未提供炸板率、连板高度、昨日涨停溢价、断板反馈和一字板比例；这里只能判断市场热度，不能判断接力质量。"
+            )
         lines = [
             f"- **盘面信号**：{score}/100（{label}，{light['label']}）",
             f"- **信号依据**：{'；'.join(light['reasons'])}",
@@ -1251,6 +1344,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             f"| 上涨/下跌/平盘 | {overview.up_count} / {overview.down_count} / {overview.flat_count} | 上涨占比(不含平盘) {up_ratio:.1%} |",
             f"| 涨停/跌停 | {overview.limit_up_count} / {overview.limit_down_count} | 涨跌停差 {limit_spread:+d} |",
             f"| 两市成交额 | {overview.total_amount:.0f} 亿 | {self._describe_turnover(overview.total_amount)} |",
+            "",
+            continuation_note,
         ]
         return "\n".join(lines)
 
@@ -1273,7 +1368,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "red": "risk-off",
             }
             guidance_map = {
-                "green": "Risk appetite is acceptable; focus on leading themes and position discipline.",
+                "green": "Risk appetite is acceptable, but keep exposure incremental when leadership evidence is incomplete.",
                 "yellow": "Signals are mixed; keep position sizing moderate and wait for confirmation.",
                 "red": "Risk is elevated; prioritize drawdown control and avoid chasing weak rebounds.",
             }
@@ -1285,7 +1380,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "red": "偏防守",
             }
             guidance_map = {
-                "green": "风险偏好尚可，关注主线延续与仓位纪律。",
+                "green": "风险偏好尚可，但主线证据不足时先试错，确认后再加仓。",
                 "yellow": "信号分化，控制仓位并等待量价确认。",
                 "red": "风险偏高，优先控制回撤，避免追高弱反弹。",
             }
@@ -1387,6 +1482,28 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return ""
         lines = []
         language = self._get_review_language()
+        has_fund_flow = bool(
+            getattr(overview, "fund_inflow_sectors", None)
+            or getattr(overview, "fund_outflow_sectors", None)
+        )
+        if language == "en":
+            if has_fund_flow:
+                lines.append(
+                    "- **Theme data boundary**: rankings can be cross-checked with sector fund-flow leaders when provided; capacity leaders, front-row stocks, and diffusion chains remain unavailable, so theme conclusions are candidates pending confirmation."
+                )
+            else:
+                lines.append(
+                    "- **Data gap**: rankings contain percentage moves only; limit-up counts, turnover share, capacity leaders, front-row stocks, and diffusion chains are unavailable, so theme conclusions are candidates pending confirmation."
+                )
+        else:
+            if has_fund_flow:
+                lines.append(
+                    "- **板块数据边界**：当前榜单可结合资金净流入/流出板块交叉验证；仍未提供容量核心、前排个股和扩散链，热点只能按候选排序，不能直接确认主线。"
+                )
+            else:
+                lines.append(
+                    "- **板块数据边界**：当前榜单只含涨跌幅，未提供涨停数量、板块成交额、容量核心、前排个股和扩散链；热点只能按候选排序，不能直接确认主线。"
+                )
 
         def append_ranking(title: str, name_label: str, rows: List[Dict]) -> None:
             if not rows:
@@ -1634,34 +1751,392 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         label = str(scores["temperature_label"])
         return score, label
 
+    def _build_data_scope_input_block(self, overview: MarketOverview) -> str:
+        """Build the date/data-scope block passed to the LLM."""
+        generated_at = overview.generated_at or "N/A"
+        run_date = overview.run_date or overview.date
+        data_date = overview.data_date or overview.date
+        note = overview.data_scope_note or (
+            f"报告数据口径按 {data_date} 交易日处理。"
+            if self._get_review_language() != "en"
+            else f"Report data is treated as the {data_date} trading session."
+        )
+
+        if self._get_review_language() == "en":
+            non_trading = "yes" if overview.is_non_trading_run else "no"
+            return f"""## Data Scope
+- Generated at: {generated_at}
+- Run date: {run_date}
+- Effective trading/data date: {data_date}
+- Non-trading or after-hours reuse: {non_trading}
+- Scope note: {note}"""
+
+        non_trading = "是" if overview.is_non_trading_run else "否"
+        return f"""## 数据口径
+- 生成时间: {generated_at}
+- 运行自然日: {run_date}
+- 实际数据交易日: {data_date}
+- 是否非交易日/盘外复用: {non_trading}
+- 口径说明: {note}"""
+
+    def _build_data_gap_input_block(self, overview: MarketOverview) -> str:
+        """State unsupported strategy inputs explicitly so the model does not infer them."""
+        has_index_levels = bool(getattr(overview, "index_key_levels", None))
+        has_limit_structure = bool(getattr(overview, "limit_up_structure", None))
+        has_fund_flow = bool(
+            getattr(overview, "fund_inflow_sectors", None)
+            or getattr(overview, "fund_outflow_sectors", None)
+        )
+        evidence = getattr(overview, "a_share_evidence", {}) or {}
+        sentiment = evidence.get("sentiment_structure") if isinstance(evidence, dict) else {}
+        sentiment = sentiment if isinstance(sentiment, dict) else {}
+        has_short_index_mas = any(
+            isinstance(item, dict) and item.get("ma5") is not None and item.get("ma10") is not None
+            for item in (evidence.get("index_trend") or [])
+        ) if isinstance(evidence, dict) else False
+        has_sentiment_quality = any(
+            sentiment.get(key) is not None
+            for key in ("broken_ratio", "previous_limit_premium_median_pct", "one_price_like_ratio")
+        )
+        has_theme_candidates = bool(evidence.get("theme_candidates")) if isinstance(evidence, dict) else False
+        has_stock_candidates = bool(evidence.get("stock_candidates")) if isinstance(evidence, dict) else False
+        if self._get_review_language() == "en":
+            if has_index_levels:
+                if has_short_index_mas:
+                    lines = [
+                        "- Index trend includes MA5/MA10/MA20 and 20-day high/low when the daily-history source succeeds; volume-at-price support/resistance remains unavailable.",
+                    ]
+                else:
+                    lines = [
+                        "- Index key levels include MA20 and 20-day high/low when provided; MA5/MA10 and volume-at-price support/resistance are still unavailable.",
+                    ]
+            else:
+                lines = [
+                    "- Index moving averages (MA5/MA10/MA20), prior highs/lows, and volume-at-price support/resistance are not available in this payload.",
+                ]
+            if self.profile.has_market_stats:
+                if has_sentiment_quality:
+                    lines.append(
+                        "- Sentiment quality includes failed-board ratio, previous-limit premium, continuation height, and a one-price-board heuristic when their date-scoped pools are available."
+                    )
+                elif has_limit_structure:
+                    lines.append(
+                        "- Limit-up structure includes current limit-up pool size, maximum continuation height, break count, and industry distribution when provided; previous-limit-up premium, broken-board feedback, and one-tick board ratio are still not available."
+                    )
+                else:
+                    lines.append(
+                        "- Breadth contains advancers/decliners and limit-up/limit-down counts only; failed boards, limit-up continuation height, previous-limit-up premium, broken-board feedback, and one-tick board ratio are not available."
+                    )
+            else:
+                lines.append("- Breadth and limit-up/limit-down structure are not available for this market.")
+            if self.profile.has_sector_rankings:
+                if has_theme_candidates and has_stock_candidates:
+                    lines.append(
+                        "- Theme and stock watchlists are evidence-ranked candidates from sector/concept rankings and date-scoped limit-up pools; trend-core coverage outside those pools remains unavailable."
+                    )
+                elif has_fund_flow:
+                    lines.append(
+                        "- Sector/theme rankings include percentage moves and fund-flow leaders when provided; capacity leaders, front-row stocks, and diffusion chains are still not available."
+                    )
+                else:
+                    lines.append(
+                        "- Sector/theme rankings contain percentage moves only; limit-up counts, turnover share, capacity leaders, front-row stocks, and diffusion chains are not available."
+                    )
+            else:
+                lines.append("- Sector/theme rankings are not available for this market.")
+            lines.append(
+                "- Therefore, classify themes as candidates only; do not promote a one-day ranking into a confirmed main line without confirmation conditions."
+            )
+            return "## Data Gaps\n" + "\n".join(lines)
+
+        if has_index_levels:
+            if has_short_index_mas:
+                lines = [
+                    "- 当前指数趋势可提供 MA5/MA10/MA20 和 20 日高低点（若日线源成功）；仍未提供成交密集区，不能把关键位写成精确预测。",
+                ]
+            else:
+                lines = [
+                    "- 当前指数关键位可提供 MA20 和 20 日高低点（若数据源成功）；仍未提供 MA5/MA10 和成交密集区，不能把关键位写成精确预测。",
+                ]
+        else:
+            lines = [
+                "- 当前指数数据未提供 MA5/MA10/MA20、前高前低、成交密集区，不能精确给出技术支撑/压力。",
+            ]
+        if self.profile.has_market_stats:
+            if has_sentiment_quality:
+                lines.append(
+                    "- 当前接力质量可使用炸板率、昨日涨停溢价、连板高度和疑似一字板比例；缺失的日期化事件池必须按数据质量标记降级。"
+                )
+            elif has_limit_structure:
+                lines.append(
+                    "- 当前涨停结构可提供涨停池、最高连板、炸板次数和行业分布（若数据源成功）；仍未提供昨日涨停溢价、断板反馈和一字板比例。"
+                )
+            else:
+                lines.append(
+                    "- 当前情绪数据只有涨跌家数、涨跌停家数和成交额；未提供炸板率、连板高度、昨日涨停溢价、断板反馈、一字板比例，不能评估接力质量。"
+                )
+        else:
+            lines.append("- 当前市场不提供涨跌家数、涨跌停和成交额汇总，不能评估市场宽度与短线接力。")
+        if self.profile.has_sector_rankings:
+            if has_theme_candidates and has_stock_candidates:
+                lines.append(
+                    "- 当前已提供基于板块排行与日期化涨停池交叉评分的题材候选和观察票；涨停池之外的趋势核心仍需个股分析另行确认。"
+                )
+            elif has_fund_flow:
+                lines.append(
+                    "- 当前板块/题材榜可结合涨跌幅与资金净流入/流出榜（若数据源成功）；仍未提供容量核心、前排个股和扩散链，不能直接认定主线。"
+                )
+            else:
+                lines.append(
+                    "- 当前板块/题材榜只有涨跌幅；未提供涨停数量、板块成交额、容量核心、前排个股和扩散链，不能直接认定主线。"
+                )
+        else:
+            lines.append("- 当前市场不提供行业/概念涨跌榜，不能做热点排序。")
+        lines.append(
+            "- 因此只能给“候选方向 + 次日确认条件”，不能把单日快照写成确定性交易主线。"
+        )
+        return "## 数据缺口\n" + "\n".join(lines)
+
+    def _build_a_share_evidence_input_block(self, overview: MarketOverview) -> str:
+        evidence = getattr(overview, "a_share_evidence", {}) or {}
+        if self.region != "cn" or not isinstance(evidence, dict) or not evidence:
+            return ""
+
+        sentiment = evidence.get("sentiment_structure") or {}
+        themes = [item for item in (evidence.get("theme_candidates") or []) if isinstance(item, dict)][:6]
+        stocks = [item for item in (evidence.get("stock_candidates") or []) if isinstance(item, dict)][:10]
+        risk_rules = [item for item in (evidence.get("risk_rules") or []) if isinstance(item, dict)]
+        quality = evidence.get("data_quality") or {}
+
+        if self._get_review_language() == "en":
+            lines = [
+                "## A-share Sentiment and Theme Evidence",
+                f"- Evidence status: {self._prompt_cell(evidence.get('status') or 'unknown')}",
+                (
+                    "- Sentiment: limit-up {limit_up}; failed boards {broken}; failed-board ratio {ratio}; "
+                    "limit-down {limit_down}; highest board {height}; previous-limit premium median {premium}; "
+                    "one-price heuristic {one_price}."
+                ).format(
+                    limit_up=sentiment.get("limit_up_count", "N/A"),
+                    broken=self._format_prompt_metric(sentiment.get("broken_board_count")),
+                    ratio=self._format_prompt_ratio(sentiment.get("broken_ratio")),
+                    limit_down=self._format_prompt_metric(sentiment.get("limit_down_count")),
+                    height=self._format_prompt_metric(sentiment.get("highest_consecutive_board")),
+                    premium=self._format_prompt_pct(sentiment.get("previous_limit_premium_median_pct")),
+                    one_price=self._format_prompt_ratio(sentiment.get("one_price_like_ratio")),
+                ),
+            ]
+            triggered = [item for item in risk_rules if item.get("triggered")]
+            if triggered:
+                lines.append("- Triggered risk gates:")
+                lines.extend(
+                    f"  - {self._prompt_cell(item.get('code'))}: {self._prompt_cell(item.get('evidence'))}; {self._prompt_cell(item.get('action'))}"
+                    for item in triggered
+                )
+            if themes:
+                lines.extend([
+                    "### Ranked Theme Candidates",
+                    "| Theme | Class | Score | Limit-up | Height | Confirmation | Invalidation |",
+                    "| --- | --- | ---: | ---: | ---: | --- | --- |",
+                ])
+                lines.extend(
+                    "| {theme} | {classification} | {score} | {limit_up} | {height} | {confirmation} | {invalidation} |".format(
+                        theme=self._prompt_cell(item.get("theme")),
+                        classification=self._prompt_cell(item.get("classification")),
+                        score=self._format_prompt_metric(item.get("total_score")),
+                        limit_up=self._format_prompt_metric(item.get("limit_up_count")),
+                        height=self._format_prompt_metric(item.get("max_board_height")),
+                        confirmation=self._prompt_cell(item.get("confirmation")),
+                        invalidation=self._prompt_cell(item.get("invalidation")),
+                    )
+                    for item in themes
+                )
+            if stocks:
+                lines.extend([
+                    "### Core Watchlist Candidates",
+                    "| Role | Code | Name | Theme | Entry type | Confirmation | Invalidation | Risk tags |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                ])
+                lines.extend(self._format_stock_candidate_prompt_row(item) for item in stocks)
+        else:
+            lines = [
+                "## A股情绪与题材证据",
+                f"- 证据状态: {self._prompt_cell(evidence.get('status') or 'unknown')}",
+                (
+                    "- 情绪结构: 涨停 {limit_up} 家；炸板 {broken} 家；炸板率 {ratio}；跌停 {limit_down} 家；"
+                    "最高 {height} 板；昨日涨停溢价中位数 {premium}；疑似一字/无换手占比 {one_price}。"
+                ).format(
+                    limit_up=sentiment.get("limit_up_count", "N/A"),
+                    broken=self._format_prompt_metric(sentiment.get("broken_board_count")),
+                    ratio=self._format_prompt_ratio(sentiment.get("broken_ratio")),
+                    limit_down=self._format_prompt_metric(sentiment.get("limit_down_count")),
+                    height=self._format_prompt_metric(sentiment.get("highest_consecutive_board")),
+                    premium=self._format_prompt_pct(sentiment.get("previous_limit_premium_median_pct")),
+                    one_price=self._format_prompt_ratio(sentiment.get("one_price_like_ratio")),
+                ),
+            ]
+            triggered = [item for item in risk_rules if item.get("triggered")]
+            if triggered:
+                lines.append("- 已触发风险门槛:")
+                lines.extend(
+                    f"  - {self._prompt_cell(item.get('code'))}: {self._prompt_cell(item.get('evidence'))}；{self._prompt_cell(item.get('action'))}"
+                    for item in triggered
+                )
+            if themes:
+                lines.extend([
+                    "### 题材候选排序",
+                    "| 题材 | 分类 | 分数 | 涨停数 | 高度 | 次日确认 | 失效条件 |",
+                    "| --- | --- | ---: | ---: | ---: | --- | --- |",
+                ])
+                lines.extend(
+                    "| {theme} | {classification} | {score} | {limit_up} | {height} | {confirmation} | {invalidation} |".format(
+                        theme=self._prompt_cell(item.get("theme")),
+                        classification=self._prompt_cell(item.get("classification")),
+                        score=self._format_prompt_metric(item.get("total_score")),
+                        limit_up=self._format_prompt_metric(item.get("limit_up_count")),
+                        height=self._format_prompt_metric(item.get("max_board_height")),
+                        confirmation=self._prompt_cell(item.get("confirmation")),
+                        invalidation=self._prompt_cell(item.get("invalidation")),
+                    )
+                    for item in themes
+                )
+            if stocks:
+                lines.extend([
+                    "### 核心观察票候选",
+                    "| 类别 | 代码 | 名称 | 题材 | 买点类型 | 验证条件 | 失效条件 | 风险标签 |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                ])
+                lines.extend(self._format_stock_candidate_prompt_row(item) for item in stocks)
+
+        missing = quality.get("missing_fields") if isinstance(quality, dict) else None
+        contaminated = quality.get("contaminated_fields") if isinstance(quality, dict) else None
+        errors = quality.get("errors") if isinstance(quality, dict) else None
+        if missing:
+            lines.append(f"- Missing fields: {', '.join(self._prompt_cell(item) for item in missing)}")
+        if contaminated:
+            lines.append(f"- Unusable/contaminated fields: {', '.join(self._prompt_cell(item) for item in contaminated)}")
+        if errors:
+            lines.append(f"- Source failures: {'; '.join(self._prompt_cell(item) for item in errors[:6])}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _prompt_cell(value: Any) -> str:
+        return " ".join(str(value or "").replace("|", "/").split()) or "N/A"
+
+    @staticmethod
+    def _format_prompt_metric(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        if isinstance(value, float):
+            return f"{value:.2f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    @staticmethod
+    def _format_prompt_ratio(value: Any) -> str:
+        try:
+            return f"{float(value):.1%}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    @staticmethod
+    def _format_prompt_pct(value: Any) -> str:
+        try:
+            return f"{float(value):+.2f}%"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def _format_stock_candidate_prompt_row(self, item: Dict[str, Any]) -> str:
+        themes = item.get("themes") or []
+        risk_tags = item.get("risk_tags") or []
+        return "| {category} | {code} | {name} | {themes} | {buy_point} | {validation} | {invalidation} | {risk_tags} |".format(
+            category=self._prompt_cell(item.get("category")),
+            code=self._prompt_cell(item.get("code")),
+            name=self._prompt_cell(item.get("name")),
+            themes=self._prompt_cell("、".join(str(value) for value in themes)),
+            buy_point=self._prompt_cell(item.get("buy_point_type")),
+            validation=self._prompt_cell(item.get("validation")),
+            invalidation=self._prompt_cell(item.get("invalidation")),
+            risk_tags=self._prompt_cell("、".join(str(value) for value in risk_tags)),
+        )
+
+    def _build_data_scope_report_block(self, overview: MarketOverview) -> str:
+        """Build a deterministic report section for date/data scope."""
+        generated_at = overview.generated_at or "N/A"
+        run_date = overview.run_date or overview.date
+        data_date = overview.data_date or overview.date
+        note = overview.data_scope_note or f"报告数据口径按 {data_date} 交易日处理。"
+
+        if self._get_review_language() == "en":
+            return "\n".join(
+                [
+                    "### 1. Data Scope",
+                    "| Item | Scope |",
+                    "|------|-------|",
+                    f"| Generated at | {generated_at} |",
+                    f"| Run date | {run_date} |",
+                    f"| Effective trading/data date | {data_date} |",
+                    f"| Non-trading or after-hours reuse | {'yes' if overview.is_non_trading_run else 'no'} |",
+                    f"| Scope note | {note} |",
+                ]
+            )
+
+        return "\n".join(
+            [
+                "### 一、数据口径",
+                "| 项目 | 口径 |",
+                "|------|------|",
+                f"| 生成时间 | {generated_at} |",
+                f"| 运行自然日 | {run_date} |",
+                f"| 实际数据交易日 | {data_date} |",
+                f"| 是否非交易日/盘外复用 | {'是' if overview.is_non_trading_run else '否'} |",
+                f"| 说明 | {note} |",
+            ]
+        )
+
     def _build_output_template_sections(self, review_language: str) -> str:
         """Build LLM output sections according to market data capabilities."""
         if review_language == "en":
             if self.profile.has_market_stats and self.profile.has_sector_rankings:
-                return """### 3. Fund Flows
-(Interpret what turnover, participation, and flow signals imply.)
+                return """### 1. Data Scope
+(State generated time, effective trading/data date, and whether the report was generated on a non-trading or after-hours date.)
 
-### 4. Sector Highlights
-(Distinguish industry-sector moves from concept/theme moves, then analyze drivers and persistence; when global context shows a big move in a related industry, explain the cross-market linkage. Cross-check fund inflow/outflow leaders against gain/loss rankings; if a sector rises while showing fund outflow, flag questionable persistence.)
+### 2. Market Summary
+(Summarize tone, breadth, and whether the report is only a snapshot or can support a next-session plan.)
 
-### 5. Outlook
-(Provide the near-term outlook based on price action, news, and — when provided — global market context; combine the limit-up structure, consecutive-board height, and break count to judge sentiment strength and loss-making effects.)
+### 3. Index Risk Gates
+(Discuss index strength/weakness using provided key levels when available; explicitly say if MA5/MA10/MA20 or support/resistance data is unavailable.)
 
-### 6. Risk Alerts
-(List the main risks to monitor.)
+### 4. Sentiment Temperature
+(Use turnover, breadth, limit-up/down counts, and the limit-up structure when provided. If board-failure rate, continuation height, previous-limit-up premium, broken-board feedback, or one-tick board ratio is absent, explicitly state the limitation.)
 
-### 7. Strategy Plan
-(Provide an offensive/balanced/defensive stance, a position-sizing guideline, and one invalidation trigger anchored to provided observable data such as index key levels, global indices, or sector fund-flow persistence; do not use unverifiable wording like "if the market weakens". End with "For reference only, not investment advice.")"""
+### 5. Theme Ranking
+(Classify sectors/themes as main-line candidates, diffusion, laggards, or unconfirmed one-day rotation. Cross-check gain/loss rankings with fund inflow/outflow leaders; if a sector rises while showing fund outflow, flag questionable persistence. When global context shows a large related move, explain the transmission chain.)
 
-            section_number = 3
-            sections: List[str] = []
+### 6. Core Watchlist
+(If no stock-level leaders are provided, say no verifiable watchlist is available and give only sector-level observation conditions.)
+
+### 7. Next-Session Strategy
+(Start with what not to buy, then list confirmation conditions, entry trigger types, invalidation triggers, and position caps. Invalidation triggers must be anchored to provided observable data such as index key levels, global indices, limit-up structure, or sector fund-flow persistence. Do not use unverifiable wording like "if the market weakens". If main-line evidence is incomplete, use observation/trial positions before raising exposure.)
+
+### 8. Risk Alerts
+(List the main risks to monitor and end with "For reference only, not investment advice.")"""
+
+            sections: List[str] = [
+                """### 1. Data Scope
+(State generated time, effective trading/data date, and whether the report was generated on a non-trading or after-hours date.)""",
+                """### 2. Market Summary
+(Summarize tone, available breadth/liquidity inputs, and whether the report is only a snapshot or can support a next-session plan.)""",
+                """### 3. Index Risk Gates
+(Discuss index strength/weakness using provided key levels when available; explicitly say if MA5/MA10/MA20 or support/resistance data is unavailable.)""",
+            ]
+            section_number = 4
             if self.profile.has_market_stats:
-                sections.append(f"""### {section_number}. Fund Flows
-(Interpret only the provided turnover, participation, breadth, and flow signals.)""")
+                sections.append(f"""### {section_number}. Sentiment Temperature
+(Interpret only the provided turnover, participation, breadth, and flow signals. Use limit-up structure when provided and explicitly identify missing short-term continuation data.)""")
                 section_number += 1
             if self.profile.has_sector_rankings:
-                sections.append(f"""### {section_number}. Sector Highlights
-(Analyze only the provided industry-sector and concept/theme rankings.)""")
+                sections.append(f"""### {section_number}. Theme Ranking
+(Analyze only the provided industry-sector and concept/theme rankings; classify them as candidates, not confirmed main lines, if leader/turnover/limit-up-chain evidence is unavailable.)""")
                 section_number += 1
             sections.extend([
                 f"""### {section_number}. News Catalysts
@@ -1671,28 +2146,37 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 f"""### {section_number + 2}. Risk Alerts
 (List the main risks to monitor.)""",
                 f"""### {section_number + 3}. Strategy Plan
-(Provide an offensive/balanced/defensive stance, a position-sizing guideline, one invalidation trigger, and end with "For reference only, not investment advice.")""",
+(Start with what not to buy, then list confirmation conditions, entry trigger types, invalidation triggers, and position caps. Anchor invalidation to observable data when available. End with "For reference only, not investment advice.")""",
             ])
             return "\n\n".join(sections)
 
         if self.profile.has_market_stats and self.profile.has_sector_rankings:
-            return """### 三、板块主线
-（区分行业板块与概念题材，分析领涨/领跌背后的逻辑、持续性和是否形成主线；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系，说明"谁在打谁、资金从哪来到哪去"；资金净流入/流出榜与涨跌幅榜交叉验证：涨幅高但资金流出的板块要提示持续性存疑）
+            return """### 一、数据口径
+（写明生成时间、实际数据交易日、是否非交易日/盘外复用；明确“今日/明日”的交易日含义）
 
-### 四、资金与情绪
-（解读成交额、涨跌停结构、市场宽度和风险偏好；结合涨停结构（连板高度、炸板情况）判断情绪强度与亏钱效应）
+### 二、盘面总览
+（概括指数、涨跌家数、成交额和情绪温度，明确这是大盘快照还是可执行策略）
 
-### 五、消息催化
-（结合近三日新闻与外围市场表现，先判断当日走势是否由外围事件驱动，再提炼真正影响明日交易的催化或扰动；新闻与外围数据均缺失时明确说明，不得写"今日无消息"）
+### 三、大盘风险门槛
+（说明上证、沪深300、创业板、科创50强弱；有指数关键位时引用关键位，没有 MA5/MA10/MA20、前高前低和支撑压力数据时必须明确写“暂无精确门槛”，不得编造）
 
-### 六、明日交易计划
-（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件；触发失效条件必须引用已提供的可观察锚点（指数关键位、外围指数或板块资金持续性），禁止使用"若市场走弱"这类不可验证表述）
+### 四、情绪温度
+（解读成交额、涨跌停、市场宽度；有涨停结构时结合连板高度、炸板情况判断情绪强度与亏钱效应；缺少昨日涨停溢价、断板反馈和一字板比例时必须说明，区分“热度”和“接力质量”）
 
-### 七、风险提示
+### 五、热点排序
+（把行业/概念分为：主线候选、扩散、补涨、伪相关/单日轮动；交叉验证资金净流入/流出榜与涨跌幅榜，涨幅高但资金流出的板块提示持续性存疑；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系）
+
+### 六、核心观察票
+（若未提供个股龙头/容量票/趋势核心数据，必须写“暂无可验证观察票”，只能给板块级观察条件，不得编造股票）
+
+### 七、明日交易计划
+（先写不能买什么，再写确认条件，最后写买点类型、失效位和仓位上限；触发失效条件必须引用已提供的可观察锚点（指数关键位、外围指数、涨停结构或板块资金持续性），禁止使用“若市场走弱”这类不可验证表述；主线未确认时以观察/试错仓为主，只有指数与主线共振确认后再升仓）
+
+### 八、风险提示
 （列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）"""
 
         numerals = ["一", "二", "三", "四", "五", "六", "七", "八"]
-        section_number = 3
+        section_number = 1
         sections: List[str] = []
 
         def add_section(title: str, hint: str) -> None:
@@ -1700,15 +2184,18 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             sections.append(f"### {numerals[section_number - 1]}、{title}\n{hint}")
             section_number += 1
 
+        add_section("数据口径", "（写明生成时间、实际数据交易日、是否非交易日/盘外复用；明确“今日/明日”的交易日含义）")
+        add_section("盘面总览", "（概括指数、可用市场宽度、成交活跃度和整体风险状态，明确这是大盘快照还是可执行策略）")
+        add_section("大盘风险门槛", "（说明指数强弱；有指数关键位时引用关键位；没有 MA5/MA10/MA20、前高前低和支撑压力数据时必须明确写“暂无精确门槛”，不得编造）")
         if self.profile.has_sector_rankings:
-            add_section("板块主线", "（仅分析已提供的行业板块与概念题材榜单，不扩展未提供的数据）")
+            add_section("热点排序", "（仅分析已提供的行业板块与概念题材榜单；缺少龙头/成交额/涨停链时只给候选排序，不确认主线）")
         if self.profile.has_market_stats:
-            add_section("资金与情绪", "（仅解读已提供的成交额、涨跌停结构、市场宽度和风险偏好数据）")
+            add_section("情绪温度", "（仅解读已提供的成交额、涨跌停结构、市场宽度和风险偏好数据；有涨停结构时引用，缺失时明确缺失的接力质量指标）")
         add_section(
             "消息催化",
             "（结合近三日新闻和指数表现，提炼真正影响明日交易的催化或扰动；不要推断未提供的资金流、市场宽度或板块榜）",
         )
-        add_section("明日交易计划", "（给出进攻/均衡/防守结论、仓位区间、关注方向、回避方向和一个触发失效条件）")
+        add_section("明日交易计划", "（先写不能买什么，再写确认条件、买点类型、失效位和仓位上限；尽量锚定已提供的可观察数据）")
         add_section("风险提示", "（列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）")
         return "\n\n".join(sections)
 
@@ -1773,14 +2260,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if index_key_levels:
             if review_language == "en":
                 rows = [
-                    "| Index | Current | MA20 | 20D High | 20D Low |",
-                    "| --- | ---: | ---: | ---: | ---: |",
+                    "| Index | Current | MA5 | MA10 | MA20 | 20D High | 20D Low |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
                 ]
                 for item in index_key_levels:
                     rows.append(
-                        "| {name} | {current} | {ma20} | {high_20d} | {low_20d} |".format(
+                        "| {name} | {current} | {ma5} | {ma10} | {ma20} | {high_20d} | {low_20d} |".format(
                             name=item.get("name") or "",
                             current=self._format_optional_level(item.get("current")),
+                            ma5=self._format_optional_level(item.get("ma5")),
+                            ma10=self._format_optional_level(item.get("ma10")),
                             ma20=self._format_optional_level(item.get("ma20")),
                             high_20d=self._format_optional_level(item.get("high_20d")),
                             low_20d=self._format_optional_level(item.get("low_20d")),
@@ -1792,14 +2281,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 )
             else:
                 rows = [
-                    "| 指数 | 现价 | MA20 | 近20日高 | 近20日低 |",
-                    "| --- | ---: | ---: | ---: | ---: |",
+                    "| 指数 | 现价 | MA5 | MA10 | MA20 | 近20日高 | 近20日低 |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
                 ]
                 for item in index_key_levels:
                     rows.append(
-                        "| {name} | {current} | {ma20} | {high_20d} | {low_20d} |".format(
+                        "| {name} | {current} | {ma5} | {ma10} | {ma20} | {high_20d} | {low_20d} |".format(
                             name=item.get("name") or "",
                             current=self._format_optional_level(item.get("current")),
+                            ma5=self._format_optional_level(item.get("ma5")),
+                            ma10=self._format_optional_level(item.get("ma10")),
                             ma20=self._format_optional_level(item.get("ma20")),
                             high_20d=self._format_optional_level(item.get("high_20d")),
                             low_20d=self._format_optional_level(item.get("low_20d")),
@@ -1823,6 +2314,10 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             meta = f" ({' / '.join(meta_parts)})" if meta_parts else ""
             url_line = f"\n   URL: {url}" if url else ""
             news_text += f"{i}. {title}{meta}\n   {snippet or '-'}{url_line}\n"
+
+        data_scope_block = self._build_data_scope_input_block(overview)
+        data_gap_block = self._build_data_gap_input_block(overview)
+        a_share_evidence_block = self._build_a_share_evidence_input_block(overview)
         
         # 外围市场联动块（仅 has_global_context 市场注入；数据缺失时给显式反幻觉指令）
         global_block = ""
@@ -1952,10 +2447,10 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 if data_limits_block
                 else ""
             )
-            market_summary_hint = (
-                "2-3 sentences summarizing overall market tone, index moves, and liquidity."
-                if self.profile.has_market_stats
-                else "2-3 sentences summarizing overall market tone, index moves, and available news context."
+            execution_constraints = (
+                "- If leader stocks, capacity leaders, and theme diffusion chains are not provided, do not invent a stock watchlist.\n"
+                "- If main-line evidence is incomplete, frame exposure as observation/trial positions and only raise exposure after index and theme confirmation.\n"
+                "- The strategy section must start with what not to buy, then confirmation conditions, entry trigger types, invalidation triggers, and position caps.\n"
             )
         else:
             news_search_status = getattr(self, "_news_search_status", "not_run")
@@ -1979,10 +2474,10 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 if data_limits_block
                 else ""
             )
-            market_summary_hint = (
-                "2-3句话概括指数、涨跌家数、成交额和情绪温度，明确“强势/偏暖/震荡/偏弱”判断"
-                if self.profile.has_market_stats
-                else "2-3句话概括指数表现、新闻线索和整体风险状态，不要补写未提供的市场宽度或资金流数据"
+            execution_constraints = (
+                "- 未提供个股龙头、容量核心、趋势核心、低位补涨清单时，不得编造具体观察票。\n"
+                "- 主线证据不完整时，仓位表述必须以观察/试错仓为主，只能在指数与主线共振确认后提高仓位。\n"
+                "- 明日交易计划必须按“先写不能买什么 -> 确认条件 -> 买点类型 -> 失效位 -> 仓位上限”的顺序输出。\n"
             )
 
         output_template_sections = self._build_output_template_sections(review_language)
@@ -2006,11 +2501,17 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 - No code blocks
 - Use emoji sparingly in headings (at most one per heading)
 - The entire fixed shell, headings, guidance, and conclusion must be in {shell_language_label}
-{data_boundary_requirement}{global_requirement}
+{data_boundary_requirement}{global_requirement}{execution_constraints}
 
 ---
 
 # Today's Market Data
+
+{data_scope_block}
+
+{data_gap_block}
+
+{a_share_evidence_block}
 
 ## Date
 {overview.date}
@@ -2039,12 +2540,6 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
 ## {report_title}
 
-### 1. Market Summary
-({market_summary_hint})
-
-### 2. Index Commentary
-({self._get_index_hint()})
-
 {output_template_sections}
 
 ---
@@ -2062,11 +2557,17 @@ Output the report content directly, no extra commentary.
 - emoji 仅在标题处少量使用（每个标题最多1个）
 - {workflow_hint}
 - 不要重复列出已由系统注入的表格数据；正文负责解释表格背后的含义
-{data_boundary_requirement}{global_requirement}
+{data_boundary_requirement}{global_requirement}{execution_constraints}
 
 ---
 
 # 今日市场数据
+
+{data_scope_block}
+
+{data_gap_block}
+
+{a_share_evidence_block}
 
 ## 日期
 {overview.date}
@@ -2095,13 +2596,7 @@ Output the report content directly, no extra commentary.
 
 ## {zh_report_title}
 
-> 一句话给出今日市场状态、核心矛盾和明日优先观察方向。
-
-### 一、盘面总览
-（{market_summary_hint}）
-
-### 二、指数结构
-（{self._get_index_hint()}，说明谁在护盘、谁在拖累，以及关键支撑/压力）
+> 一句话给出数据交易日市场状态、核心矛盾和下一交易日优先观察方向。
 
 {output_template_sections}
 
@@ -2149,12 +2644,33 @@ Output the report content directly, no extra commentary.
         bottom_text = separator.join([s['name'] for s in overview.bottom_sectors[:3]])
         top_concept_text = separator.join([s['name'] for s in overview.top_concepts[:3]])
         bottom_concept_text = separator.join([s['name'] for s in overview.bottom_concepts[:3]])
+        evidence = overview.a_share_evidence if isinstance(overview.a_share_evidence, dict) else {}
+        sentiment = evidence.get("sentiment_structure") if isinstance(evidence.get("sentiment_structure"), dict) else {}
+        theme_candidates = [
+            item for item in (evidence.get("theme_candidates") or []) if isinstance(item, dict)
+        ][:5]
+        stock_candidates = [
+            item for item in (evidence.get("stock_candidates") or []) if isinstance(item, dict)
+        ][:8]
 
         if template_language == "en":
+            data_scope_section = self._build_data_scope_report_block(overview)
+            data_gap_section = self._build_data_gap_input_block(overview).replace("## Data Gaps", "### Data Gaps")
             stats_section = ""
             if self.profile.has_market_stats:
+                sentiment_quality = ""
+                if sentiment:
+                    sentiment_quality = (
+                        "\n- Follow-through quality: failed-board ratio {broken}; previous-limit premium median {premium}; "
+                        "highest board {height}; one-price heuristic {one_price}."
+                    ).format(
+                        broken=self._format_prompt_ratio(sentiment.get("broken_ratio")),
+                        premium=self._format_prompt_pct(sentiment.get("previous_limit_premium_median_pct")),
+                        height=self._format_prompt_metric(sentiment.get("highest_consecutive_board")),
+                        one_price=self._format_prompt_ratio(sentiment.get("one_price_like_ratio")),
+                    )
                 stats_section = f"""
-### 3. Breadth & Liquidity
+### 4. Sentiment Temperature
 | Metric | Value |
 |--------|-------|
 | Advancers | {overview.up_count} |
@@ -2162,16 +2678,32 @@ Output the report content directly, no extra commentary.
 | Limit-up | {overview.limit_up_count} |
 | Limit-down | {overview.limit_down_count} |
 | Turnover ({self._get_turnover_unit_label()}) | {overview.total_amount:.0f} |
+{sentiment_quality or "- Follow-through quality inputs are unavailable; treat the table as market heat only."}
 """
             sector_section = ""
             if self.profile.has_sector_rankings and (top_text or bottom_text or top_concept_text or bottom_concept_text):
+                ranked_theme_lines = "\n".join(
+                    f"- {self._prompt_cell(item.get('theme'))}: {self._prompt_cell(item.get('classification'))}, "
+                    f"score {self._format_prompt_metric(item.get('total_score'))}; "
+                    f"confirmation: {self._prompt_cell(item.get('confirmation'))}; "
+                    f"invalidation: {self._prompt_cell(item.get('invalidation'))}."
+                    for item in theme_candidates
+                )
                 sector_section = f"""
-### 4. Sector / Theme Highlights
+### 5. Theme Ranking
 - **Industry Leaders**: {top_text or "N/A"}
 - **Industry Laggards**: {bottom_text or "N/A"}
 - **Concept Leaders**: {top_concept_text or "N/A"}
 - **Concept Laggards**: {bottom_concept_text or "N/A"}
+{ranked_theme_lines or "- Ranked limit-up diffusion evidence is unavailable; keep these as ranking-only candidates."}
 """
+            watchlist_lines = "\n".join(
+                f"- {self._prompt_cell(item.get('category'))} {self._prompt_cell(item.get('code'))} "
+                f"{self._prompt_cell(item.get('name'))}: {self._prompt_cell(item.get('buy_point_type'))}; "
+                f"confirmation: {self._prompt_cell(item.get('validation'))}; "
+                f"invalidation: {self._prompt_cell(item.get('invalidation'))}."
+                for item in stock_candidates
+            )
             market_names = {
                 "us": "US Market Recap",
                 "hk": "HK Market Recap",
@@ -2181,17 +2713,28 @@ Output the report content directly, no extra commentary.
             market_name = market_names.get(self.region, "A-share Market Recap")
             report = f"""## {overview.date} {market_name}
 
-### 1. Market Summary
+{data_scope_section}
+
+{data_gap_section}
+
+### 2. Market Summary
 Today's {self._get_market_scope_name(template_language)} showed **{market_mood}**.
 
-### 2. Major Indices
+### 3. Index Risk Gates
 {indices_text or "- No index data available"}
 {stats_section}
 {sector_section}
-### 5. Risk Alerts
-Market conditions can change quickly. The data above is for reference only and does not constitute investment advice.
 
-{self._get_strategy_markdown_block(template_language)}
+### 6. Core Watchlist
+{watchlist_lines or "- No verifiable stock-level watchlist is available without leader/capacity/trend stock inputs."}
+
+### 7. Next-Session Strategy
+- Avoid chasing unconfirmed one-day movers.
+- Raise exposure only after index confirmation and theme continuation are both visible.
+- Use trial positions first when leadership evidence is incomplete.
+
+### 8. Risk Alerts
+Market conditions can change quickly. The data above is for reference only and does not constitute investment advice.
 
 ---
 *Review Time: {datetime.now().strftime('%H:%M')}*
@@ -2200,6 +2743,8 @@ Market conditions can change quickly. The data above is for reference only and d
 
         market_labels = {"cn": "A股", "us": "美股", "hk": "港股", "jp": "日股", "kr": "韩股"}
         market_label = market_labels.get(self.region, "A股")
+        data_scope_section = self._build_data_scope_report_block(overview)
+        data_gap_section = self._build_data_gap_input_block(overview).replace("## 数据缺口", "### 数据缺口")
         dashboard_block = self._build_stats_block(overview) if self.profile.has_market_stats else ""
         indices_block = self._build_indices_block(overview)
         sector_block = self._build_sector_block(overview) if self.profile.has_sector_rankings else ""
@@ -2208,49 +2753,82 @@ Market conditions can change quickly. The data above is for reference only and d
             if self.profile.has_market_stats and self.profile.has_sector_rankings
             else "指数承接、消息催化和整体风险状态"
         )
-        market_summary_block = (
-            dashboard_block
-            if dashboard_block
-            else (
-                "暂无市场宽度数据。"
-                if self.profile.has_market_stats
-                else "- 当前以主要指数与可用新闻线索评估整体风险状态。"
-            )
-        )
         sector_section = (
             f"""
-### 三、板块主线
+### 五、热点排序
 {sector_block or "- 暂无板块涨跌榜数据。"}
 """
             if self.profile.has_sector_rankings
             else ""
         )
         funds_section = (
-            """
-### 四、资金与情绪
+            f"""
+### 四、情绪温度
+{dashboard_block or "- 暂无市场宽度数据。"}
+
 - 结合成交额和涨跌家数看，当前更适合等待确认，避免仅凭单一热点追高。
 """
             if self.profile.has_market_stats
             else ""
         )
+        sentiment_quality = ""
+        if sentiment:
+            sentiment_quality = (
+                "- 接力质量：炸板率 {broken}；昨日涨停溢价中位数 {premium}；最高 {height} 板；"
+                "疑似一字/无换手占比 {one_price}。"
+            ).format(
+                broken=self._format_prompt_ratio(sentiment.get("broken_ratio")),
+                premium=self._format_prompt_pct(sentiment.get("previous_limit_premium_median_pct")),
+                height=self._format_prompt_metric(sentiment.get("highest_consecutive_board")),
+                one_price=self._format_prompt_ratio(sentiment.get("one_price_like_ratio")),
+            )
+        ranked_theme_lines = "\n".join(
+            f"- {self._prompt_cell(item.get('theme'))}：{self._prompt_cell(item.get('classification'))}，"
+            f"评分 {self._format_prompt_metric(item.get('total_score'))}；"
+            f"确认={self._prompt_cell(item.get('confirmation'))}；"
+            f"失效={self._prompt_cell(item.get('invalidation'))}。"
+            for item in theme_candidates
+        )
+        watchlist_lines = "\n".join(
+            f"- {self._prompt_cell(item.get('category'))} {self._prompt_cell(item.get('code'))} "
+            f"{self._prompt_cell(item.get('name'))}：{self._prompt_cell(item.get('buy_point_type'))}；"
+            f"验证={self._prompt_cell(item.get('validation'))}；"
+            f"失效={self._prompt_cell(item.get('invalidation'))}。"
+            for item in stock_candidates
+        )
         return f"""## {overview.date} 大盘复盘
 
 > 今日{market_label}市场整体呈现**{market_mood}**态势，优先观察{summary_focus}。
 
-### 一、盘面总览
-{market_summary_block}
+{data_scope_section}
 
-### 二、指数结构
+{data_gap_section}
+
+### 二、盘面总览
+- 当前复盘先按大盘快照处理，只有指数与热点持续性同时确认后，才升级为可执行进攻策略。
+
+### 三、大盘风险门槛
 {indices_block or indices_text or "暂无指数数据。"}
-{sector_section}
-{funds_section}
 
-### 五、消息催化
+{funds_section}
+{sentiment_quality}
+{sector_section}
+{ranked_theme_lines}
+
+### 六、消息催化
 - 暂无可用新闻时，应降低对题材持续性的确定性判断。
 
-{self._get_strategy_markdown_block(template_language)}
+### 七、核心观察票
+{watchlist_lines or "- 暂无可验证观察票：当前未提供情绪龙头、容量核心、前排和低位补涨清单。"}
 
-### 七、风险提示
+### 八、明日交易计划
+- 不能买：单日冲高、无板块支撑、缺少成交确认的后排跟风。
+- 确认条件：指数不转弱，候选热点有前排继续封板或容量核心承接。
+- 买点类型：确认后的回踩承接、放量突破或分歧转一致，不做无确认追高。
+- 失效位：指数转弱、上涨家数收缩、跌停扩散或热点前排断板负反馈。
+- 仓位上限：主线未确认前以观察/试错仓为主，确认后再逐步加仓。
+
+### 九、风险提示
 - 市场有风险，投资需谨慎。以上数据仅供参考，不构成投资建议。
 
 ---

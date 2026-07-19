@@ -2257,51 +2257,90 @@ class AkshareFetcher(BaseFetcher):
         n: int = 20,
     ) -> Optional[List[Dict[str, Any]]]:
         """获取涨停池，优先按连板数和封板时间展示。"""
+        try:
+            return self.get_limit_event_pool(pool_type="limit_up", date=date, n=n)
+        except Exception:
+            return None
+
+    def get_limit_event_pool(
+        self,
+        pool_type: str,
+        date: Optional[str] = None,
+        n: int = 200,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """获取日期化涨跌停事件池并统一字段。"""
         import akshare as ak
+
+        endpoint_by_type = {
+            "limit_up": "stock_zt_pool_em",
+            "broken_board": "stock_zt_pool_zbgc_em",
+            "previous_limit": "stock_zt_pool_previous_em",
+            "limit_down": "stock_zt_pool_dtgc_em",
+        }
+        normalized_type = str(pool_type or "").strip().lower()
+        endpoint_name = endpoint_by_type.get(normalized_type)
+        if endpoint_name is None:
+            raise ValueError(f"unsupported limit event pool type: {pool_type}")
 
         query_date = date or datetime.now().strftime('%Y%m%d')
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
 
-            logger.info("[API调用] ak.stock_zt_pool_em(date=%s) 获取涨停池...", query_date)
-            df = ak.stock_zt_pool_em(date=query_date)
+            endpoint = getattr(ak, endpoint_name, None)
+            if not callable(endpoint):
+                raise AttributeError(f"akshare endpoint unavailable: {endpoint_name}")
+            logger.info("[API调用] ak.%s(date=%s) 获取%s事件池...", endpoint_name, query_date, normalized_type)
+            df = endpoint(date=query_date)
             if df is None or df.empty:
-                return None
+                return []
 
             df = df.copy()
-            for col in ('连板数', '封板资金', '成交额', '换手率', '涨跌幅'):
+            for col in (
+                '连板数', '连续跌停', '封板资金', '封单资金', '成交额', '换手率',
+                '涨跌幅', '炸板次数', '开板次数', '振幅',
+            ):
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             if '首次封板时间' in df.columns:
                 df['首次封板时间'] = df['首次封板时间'].map(self._normalize_limit_time_value)
                 df['_首次封板时间排序'] = df['首次封板时间'].where(df['首次封板时间'] != '', '999999')
-            sort_cols = [col for col in ('连板数', '_首次封板时间排序') if col in df.columns]
+            sort_cols = [col for col in ('连板数', '连续跌停', '_首次封板时间排序') if col in df.columns]
             if sort_cols:
-                ascending = [False if col == '连板数' else True for col in sort_cols]
+                ascending = [False if col in {'连板数', '连续跌停'} else True for col in sort_cols]
                 df = df.sort_values(sort_cols, ascending=ascending)
 
             rows: List[Dict[str, Any]] = []
             for _, row in df.head(n).iterrows():
                 rows.append({
+                    'pool_type': normalized_type,
                     'code': str(row.get('代码', '')).strip(),
                     'name': str(row.get('名称', '')).strip(),
                     'change_pct': self._safe_float(row.get('涨跌幅')),
                     'price': self._safe_float(row.get('最新价')),
                     'amount': self._safe_float(row.get('成交额')),
                     'turnover_rate': self._safe_float(row.get('换手率')),
-                    'seal_amount': self._safe_float(row.get('封板资金')),
+                    'amplitude': self._safe_float(row.get('振幅')),
+                    'seal_amount': self._safe_float(
+                        row.get('封板资金') if '封板资金' in row else row.get('封单资金')
+                    ),
                     'first_limit_time': str(row.get('首次封板时间', '')).strip(),
                     'last_limit_time': self._normalize_limit_time_value(row.get('最后封板时间')),
-                    'break_count': self._safe_int(row.get('炸板次数')),
-                    'limit_stat': str(row.get('涨停统计', '')).strip(),
-                    'consecutive_boards': self._safe_int(row.get('连板数')),
+                    'break_count': self._safe_int(
+                        row.get('炸板次数') if '炸板次数' in row else row.get('开板次数')
+                    ),
+                    'limit_stat': str(
+                        row.get('涨停统计') if '涨停统计' in row else row.get('跌停统计', '')
+                    ).strip(),
+                    'consecutive_boards': self._safe_int(
+                        row.get('连板数') if '连板数' in row else row.get('连续跌停')
+                    ),
                     'industry': str(row.get('所属行业', '')).strip(),
                 })
             return rows
         except Exception as e:
-            logger.warning(f"[Akshare] 获取涨停池失败: {e}")
-            return None
+            logger.warning("[Akshare] 获取%s事件池失败: %s", normalized_type, e)
+            raise
 
     @staticmethod
     def _normalize_limit_time_value(value: Any) -> str:

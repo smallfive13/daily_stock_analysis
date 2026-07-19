@@ -64,8 +64,8 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
 
             self.assertIn(f"professional {market_scope_name} analyst", prompt)
             self.assertIn("## Data Limits", prompt)
-            self.assertIn("### 3. News Catalysts", prompt)
-            self.assertNotIn("### 3. Fund Flows", prompt)
+            self.assertIn("### 4. News Catalysts", prompt)
+            self.assertNotIn("### 4. Fund Flows", prompt)
             self.assertNotIn("### 4. Sector Highlights", prompt)
             self.assertNotIn("Interpret what turnover, participation, and flow signals imply", prompt)
             self.assertNotIn("professional US/A/H market analyst", prompt)
@@ -99,7 +99,8 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
             self.assertIn(f"结构化的{market_scope_name}大盘复盘报告", prompt)
             self.assertIn(f"## 2026-02-24 {market_scope_name}大盘复盘", prompt)
             self.assertIn("## 数据边界", prompt)
-            self.assertIn("### 三、消息催化", prompt)
+            self.assertIn("### 三、大盘风险门槛", prompt)
+            self.assertIn("### 四、消息催化", prompt)
             self.assertIn(strategy_title, prompt)
             self.assertNotIn("### 三、板块主线", prompt)
             self.assertNotIn("### 四、资金与情绪", prompt)
@@ -113,10 +114,31 @@ class TestMarketAnalyzerStrategyPrompt(unittest.TestCase):
         prompt = analyzer._build_review_prompt(MarketOverview(date="2026-02-24"), [])
 
         self.assertIn("# Today's Market Data", prompt)
-        self.assertIn("### 1. Market Summary", prompt)
+        self.assertIn("### 1. Data Scope", prompt)
+        self.assertIn("### 2. Market Summary", prompt)
         self.assertIn("A-share Three-Phase Recap Strategy", prompt)
         self.assertNotIn("### 一、市场总结", prompt)
         self.assertNotIn("A股市场三段式复盘策略", prompt)
+
+    def test_cn_prompt_contains_data_scope_and_execution_constraints(self):
+        analyzer = MarketAnalyzer(region="cn")
+        overview = MarketOverview(
+            date="2026-07-03",
+            generated_at="2026-07-05T11:31:24",
+            run_date="2026-07-05",
+            data_date="2026-07-03",
+            data_scope_note="本次复盘生成于 2026-07-05，报告中的“今日”指 2026-07-03 的最新完整交易日数据。",
+            is_non_trading_run=True,
+        )
+
+        prompt = analyzer._build_review_prompt(overview, [])
+
+        self.assertIn("## 数据口径", prompt)
+        self.assertIn("实际数据交易日: 2026-07-03", prompt)
+        self.assertIn("是否非交易日/盘外复用: 是", prompt)
+        self.assertIn("未提供炸板率、连板高度、昨日涨停溢价、断板反馈、一字板比例", prompt)
+        self.assertIn("不得编造具体观察票", prompt)
+        self.assertIn("先写不能买什么", prompt)
 
     def test_jp_kr_strategy_blocks_are_localized_when_report_language_is_en(self):
         cases = [

@@ -445,6 +445,15 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_limit_event_pool(
+        self,
+        pool_type: str,
+        date: Optional[str] = None,
+        n: int = 200,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """获取日期化涨跌停事件池；不支持的来源返回 ``None``。"""
+        return None
+
     def get_index_daily_history(self, symbol: str, days: int = 30) -> Optional[List[Dict[str, Any]]]:
         """
         获取指数日线历史。
@@ -3915,3 +3924,79 @@ class DataFetcherManager:
         if last_error:
             logger.warning(f"[涨停池] 所有数据源均失败，最终错误: {last_error}")
         return []
+
+    def get_limit_event_pool_with_meta(
+        self,
+        pool_type: str,
+        date: Optional[str] = None,
+        n: int = 200,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+        """获取涨跌停事件池，并保留有序 fallback 诊断。"""
+        allowed_types = {"limit_up", "broken_board", "previous_limit", "limit_down"}
+        normalized_type = str(pool_type or "").strip().lower()
+        if normalized_type not in allowed_types:
+            raise ValueError(f"unsupported limit event pool type: {pool_type}")
+
+        source_chain: List[Dict[str, Any]] = []
+        last_error = ""
+        for fetcher in self._get_fetchers_snapshot():
+            method = getattr(fetcher, "get_limit_event_pool", None)
+            implementation = getattr(type(fetcher), "get_limit_event_pool", None)
+            if not callable(method) or implementation is BaseFetcher.get_limit_event_pool:
+                continue
+
+            started_at = time.time()
+            try:
+                data = method(pool_type=normalized_type, date=date, n=n)
+                duration_ms = int((time.time() - started_at) * 1000)
+                if isinstance(data, list) and data:
+                    source_chain.append(
+                        {
+                            "provider": fetcher.name,
+                            "status": "ok",
+                            "duration_ms": duration_ms,
+                        }
+                    )
+                    return data[:n], source_chain, ""
+
+                last_error = f"{fetcher.name}返回空结果"
+                source_chain.append(
+                    {
+                        "provider": fetcher.name,
+                        "status": "empty",
+                        "duration_ms": duration_ms,
+                    }
+                )
+                # A successful empty date-scoped response is valid evidence.
+                return [], source_chain, ""
+            except Exception as exc:
+                error_type, error_reason = summarize_exception(exc)
+                duration_ms = int((time.time() - started_at) * 1000)
+                last_error = f"{fetcher.name} ({error_type}) {error_reason}"
+                source_chain.append(
+                    {
+                        "provider": fetcher.name,
+                        "status": "failed",
+                        "duration_ms": duration_ms,
+                        "error": error_reason,
+                    }
+                )
+                logger.warning(
+                    "[%s] 获取%s事件池失败: %s",
+                    fetcher.name,
+                    normalized_type,
+                    error_reason,
+                )
+
+        return [], source_chain, last_error
+
+    def get_limit_event_pool(
+        self,
+        pool_type: str,
+        date: Optional[str] = None,
+        n: int = 200,
+    ) -> List[Dict[str, Any]]:
+        rows, _, last_error = self.get_limit_event_pool_with_meta(pool_type=pool_type, date=date, n=n)
+        if not rows and last_error:
+            logger.warning("[%s事件池] 所有数据源均失败，最终错误: %s", pool_type, last_error)
+        return rows

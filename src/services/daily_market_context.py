@@ -68,6 +68,9 @@ class DailyMarketContext:
     risk_tags: List[str] = field(default_factory=list)
     source: str = "unknown"
     position_cap: Optional[str] = None
+    sentiment_structure: Dict[str, Any] = field(default_factory=dict)
+    theme_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    stock_candidates: List[Dict[str, Any]] = field(default_factory=list)
     created_at: Optional[datetime] = None
     history_id: Optional[int] = None
     query_id: Optional[str] = None
@@ -83,6 +86,12 @@ class DailyMarketContext:
         }
         if self.position_cap:
             payload["position_cap"] = self.position_cap
+        if self.sentiment_structure:
+            payload["sentiment_structure"] = dict(self.sentiment_structure)
+        if self.theme_candidates:
+            payload["theme_candidates"] = [dict(item) for item in self.theme_candidates[:3]]
+        if self.stock_candidates:
+            payload["stock_candidates"] = [dict(item) for item in self.stock_candidates[:5]]
         return payload
 
 
@@ -613,6 +622,14 @@ class DailyMarketContextService:
             return None
         risk_signal_text = _join_text_parts(summary, _extract_market_light_signal_text(scoped_payload))
         risk_tags = _extract_risk_tags(risk_signal_text)
+        sentiment_structure, theme_candidates, stock_candidates, evidence_risk_tags = (
+            _extract_a_share_review_context(scoped_payload)
+        )
+        risk_tags = _dedupe_strings(
+            risk_tags
+            + evidence_risk_tags
+            + _map_a_share_risk_tags_to_guardrails(evidence_risk_tags)
+        )
         position_cap = _extract_position_cap(risk_signal_text)
         full_report = _extract_full_market_report(
             scoped_payload=scoped_payload,
@@ -625,11 +642,205 @@ class DailyMarketContextService:
             risk_tags=risk_tags,
             source=source,
             position_cap=position_cap,
+            sentiment_structure=sentiment_structure,
+            theme_candidates=theme_candidates,
+            stock_candidates=stock_candidates,
             created_at=created_at if isinstance(created_at, datetime) else None,
             history_id=history_id if isinstance(history_id, int) else None,
             query_id=query_id if isinstance(query_id, str) and query_id else None,
             full_report=full_report,
         )
+
+
+def _extract_a_share_review_context(
+    payload: Mapping[str, Any],
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    evidence = payload.get("a_share_evidence")
+    if not isinstance(evidence, Mapping):
+        return {}, [], [], []
+
+    raw_sentiment = evidence.get("sentiment_structure")
+    sentiment: Dict[str, Any] = {}
+    if isinstance(raw_sentiment, Mapping):
+        allowed_sentiment_keys = (
+            "limit_up_count",
+            "broken_board_count",
+            "broken_ratio",
+            "limit_down_count",
+            "previous_limit_premium_median_pct",
+            "highest_consecutive_board",
+            "one_price_like_ratio",
+        )
+        sentiment = {
+            key: raw_sentiment.get(key)
+            for key in allowed_sentiment_keys
+            if raw_sentiment.get(key) is not None
+        }
+
+    themes: List[Dict[str, Any]] = []
+    for item in evidence.get("theme_candidates") or []:
+        if not isinstance(item, Mapping):
+            continue
+        theme = _clean_context_text(item.get("theme"))
+        if not theme:
+            continue
+        themes.append(
+            {
+                "theme": theme,
+                "classification": _clean_context_text(item.get("classification")),
+                "total_score": item.get("total_score"),
+                "confirmation": _clean_context_text(item.get("confirmation")),
+                "invalidation": _clean_context_text(item.get("invalidation")),
+            }
+        )
+        if len(themes) >= 3:
+            break
+
+    stocks: List[Dict[str, Any]] = []
+    for item in evidence.get("stock_candidates") or []:
+        if not isinstance(item, Mapping):
+            continue
+        code = _clean_context_text(item.get("code"))
+        name = _clean_context_text(item.get("name"))
+        if not code and not name:
+            continue
+        themes_value = item.get("themes")
+        stock_themes = [
+            _clean_context_text(value)
+            for value in themes_value
+            if _clean_context_text(value)
+        ] if isinstance(themes_value, list) else []
+        stocks.append(
+            {
+                "category": _clean_context_text(item.get("category")),
+                "code": code,
+                "name": name,
+                "themes": stock_themes[:3],
+                "validation": _clean_context_text(item.get("validation")),
+                "invalidation": _clean_context_text(item.get("invalidation")),
+            }
+        )
+        if len(stocks) >= 5:
+            break
+
+    raw_risk_tags = evidence.get("risk_tags")
+    risk_tags = [
+        _clean_context_text(item)
+        for item in raw_risk_tags
+        if _clean_context_text(item)
+    ] if isinstance(raw_risk_tags, list) else []
+    return sentiment, themes, stocks, risk_tags
+
+
+def _map_a_share_risk_tags_to_guardrails(risk_tags: List[str]) -> List[str]:
+    mapping = {
+        "high_broken_board_ratio": "high_risk",
+        "negative_previous_limit_premium": "market_cooling",
+        "growth_index_below_short_ma": "conservative",
+        "one_price_concentration": "conservative",
+    }
+    return [mapping[tag] for tag in risk_tags if tag in mapping]
+
+
+def _clean_context_text(value: Any) -> str:
+    return " ".join(str(value or "").replace("|", "/").split())
+
+
+def _dedupe_strings(values: Iterable[str]) -> List[str]:
+    result: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _format_a_share_prompt_lines(payload: Mapping[str, Any], language: str) -> List[str]:
+    sentiment = payload.get("sentiment_structure")
+    themes = payload.get("theme_candidates")
+    stocks = payload.get("stock_candidates")
+    lines: List[str] = []
+
+    if isinstance(sentiment, Mapping) and sentiment:
+        broken_ratio = _format_context_ratio(sentiment.get("broken_ratio"))
+        premium = _format_context_pct(sentiment.get("previous_limit_premium_median_pct"))
+        one_price = _format_context_ratio(sentiment.get("one_price_like_ratio"))
+        if language in ("en", "ko"):
+            lines.append(
+                "  A-share sentiment evidence: limit-up {limit_up}; failed-board ratio {broken}; "
+                "limit-down {limit_down}; previous-limit premium median {premium}; highest board {height}; "
+                "one-price heuristic {one_price}.".format(
+                    limit_up=sentiment.get("limit_up_count", "N/A"),
+                    broken=broken_ratio,
+                    limit_down=sentiment.get("limit_down_count", "N/A"),
+                    premium=premium,
+                    height=sentiment.get("highest_consecutive_board", "N/A"),
+                    one_price=one_price,
+                )
+            )
+        else:
+            lines.append(
+                "  A股情绪证据：涨停 {limit_up} 家；炸板率 {broken}；跌停 {limit_down} 家；"
+                "昨日涨停溢价中位数 {premium}；最高 {height} 板；疑似一字/无换手占比 {one_price}。".format(
+                    limit_up=sentiment.get("limit_up_count", "N/A"),
+                    broken=broken_ratio,
+                    limit_down=sentiment.get("limit_down_count", "N/A"),
+                    premium=premium,
+                    height=sentiment.get("highest_consecutive_board", "N/A"),
+                    one_price=one_price,
+                )
+            )
+
+    if isinstance(themes, list) and themes:
+        label = "Ranked theme candidates" if language in ("en", "ko") else "题材候选"
+        values = []
+        for item in themes[:3]:
+            if not isinstance(item, Mapping):
+                continue
+            values.append(
+                "{theme}({classification}, score={score}, confirm={confirmation}, invalidate={invalidation})".format(
+                    theme=_clean_context_text(item.get("theme")),
+                    classification=_clean_context_text(item.get("classification")),
+                    score=item.get("total_score", "N/A"),
+                    confirmation=_clean_context_text(item.get("confirmation")),
+                    invalidation=_clean_context_text(item.get("invalidation")),
+                )
+            )
+        if values:
+            lines.append(f"  {label}: " + "; ".join(values))
+
+    if isinstance(stocks, list) and stocks:
+        label = "Market watchlist candidates" if language in ("en", "ko") else "市场观察票候选"
+        values = []
+        for item in stocks[:5]:
+            if not isinstance(item, Mapping):
+                continue
+            values.append(
+                "{category} {code} {name} (confirm={validation}, invalidate={invalidation})".format(
+                    category=_clean_context_text(item.get("category")),
+                    code=_clean_context_text(item.get("code")),
+                    name=_clean_context_text(item.get("name")),
+                    validation=_clean_context_text(item.get("validation")),
+                    invalidation=_clean_context_text(item.get("invalidation")),
+                )
+            )
+        if values:
+            lines.append(f"  {label}: " + "; ".join(values))
+    return lines
+
+
+def _format_context_ratio(value: Any) -> str:
+    try:
+        return f"{float(value):.1%}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _format_context_pct(value: Any) -> str:
+    try:
+        return f"{float(value):+.2f}%"
+    except (TypeError, ValueError):
+        return "N/A"
 
 
 def format_daily_market_context_prompt_section(
@@ -658,6 +869,7 @@ def format_daily_market_context_prompt_section(
     ] if isinstance(payload.get("risk_tags"), list) else []
     position_cap = str(payload.get("position_cap") or "").strip()
     source = str(payload.get("source") or "").strip()
+    evidence_lines = _format_a_share_prompt_lines(payload, language)
 
     if language in ("en", "ko"):
         label = _REGION_LABEL_EN.get(region, region)
@@ -670,6 +882,7 @@ def format_daily_market_context_prompt_section(
             lines.append(f"- Date: {trade_date}")
         lines.append("- BEGIN_UNTRUSTED_MARKET_SUMMARY")
         lines.append(f"  {summary}")
+        lines.extend(evidence_lines)
         lines.append("- END_UNTRUSTED_MARKET_SUMMARY")
         if risk_tags:
             lines.append(f"- Risk tags: {', '.join(risk_tags)}")
@@ -690,6 +903,7 @@ def format_daily_market_context_prompt_section(
         lines.append(f"- 日期：{trade_date}")
     lines.append("- BEGIN_UNTRUSTED_MARKET_SUMMARY")
     lines.append(f"  {summary}")
+    lines.extend(evidence_lines)
     lines.append("- END_UNTRUSTED_MARKET_SUMMARY")
     if risk_tags:
         lines.append(f"- 风险标签：{', '.join(risk_tags)}")

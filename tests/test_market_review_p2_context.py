@@ -97,6 +97,8 @@ class IndexKeyLevelsTestCase(unittest.TestCase):
     def test_compute_index_key_levels_normal(self) -> None:
         result = compute_index_key_levels(_bars(20))
 
+        self.assertEqual(result["ma5"], 118.0)
+        self.assertEqual(result["ma10"], 115.5)
         self.assertEqual(result["ma20"], 110.5)
         self.assertEqual(result["high_20d"], 121.0)
         self.assertEqual(result["low_20d"], 100.0)
@@ -130,7 +132,7 @@ class P2PromptContextTestCase(unittest.TestCase):
         self.assertIn("涨停池数量: 68 家 | 最高连板: 4 板（机器人B） | 炸板次数合计: 9", prompt)
         self.assertIn("涨停行业分布: 机器人(5家)、半导体(3家)", prompt)
         self.assertIn("## 指数关键位参考（基于日线本地计算，非预测）", prompt)
-        self.assertIn("| 上证指数 | 3200.00 | 3150.50 | 3300.00 | 3000.00 |", prompt)
+        self.assertIn("| 上证指数 | 3200.00 | N/A | N/A | 3150.50 | 3300.00 | 3000.00 |", prompt)
         self.assertIn("触发失效条件必须引用已提供的可观察锚点", prompt)
 
     def test_prompt_omits_new_blocks_when_data_missing(self) -> None:
