@@ -2155,22 +2155,22 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 （写明生成时间、实际数据交易日、是否非交易日/盘外复用；明确“今日/明日”的交易日含义）
 
 ### 二、盘面总览
-（概括指数、涨跌家数、成交额和情绪温度，明确这是大盘快照还是可执行策略）
+（概括指数、涨跌家数、成交额和情绪温度，先判断当日走势是否由外围事件驱动，明确这是大盘快照还是可执行策略）
 
 ### 三、大盘风险门槛
 （说明上证、沪深300、创业板、科创50强弱；有指数关键位时引用关键位，没有 MA5/MA10/MA20、前高前低和支撑压力数据时必须明确写“暂无精确门槛”，不得编造）
 
 ### 四、情绪温度
-（解读成交额、涨跌停、市场宽度；有涨停结构时结合连板高度、炸板情况判断情绪强度与亏钱效应；缺少昨日涨停溢价、断板反馈和一字板比例时必须说明，区分“热度”和“接力质量”）
+（解读成交额、涨跌停、市场宽度；结合涨停结构（连板高度、炸板情况）判断情绪强度与亏钱效应；缺少昨日涨停溢价、断板反馈和一字板比例时必须说明，区分“热度”和“接力质量”）
 
 ### 五、热点排序
-（把行业/概念分为：主线候选、扩散、补涨、伪相关/单日轮动；交叉验证资金净流入/流出榜与涨跌幅榜，涨幅高但资金流出的板块提示持续性存疑；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系）
+（把行业/概念分为：主线候选、扩散、补涨、伪相关/单日轮动；资金净流入/流出榜与涨跌幅榜交叉验证，涨幅高但资金流出的板块提示持续性存疑；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系，以及谁在打谁、资金从哪来到哪去）
 
 ### 六、核心观察票
 （若未提供个股龙头/容量票/趋势核心数据，必须写“暂无可验证观察票”，只能给板块级观察条件，不得编造股票）
 
 ### 七、明日交易计划
-（先写不能买什么，再写确认条件，最后写买点类型、失效位和仓位上限；触发失效条件必须引用已提供的可观察锚点（指数关键位、外围指数、涨停结构或板块资金持续性），禁止使用“若市场走弱”这类不可验证表述；主线未确认时以观察/试错仓为主，只有指数与主线共振确认后再升仓）
+（先写不能买什么，再写确认条件，最后写买点类型、失效位和仓位上限；触发失效条件必须引用已提供的可观察锚点（指数关键位、外围指数、涨停结构或板块资金持续性），禁止使用"若市场走弱"这类不可验证表述；主线未确认时以观察/试错仓为主，只有指数与主线共振确认后再升仓）
 
 ### 八、风险提示
 （列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）"""
@@ -2654,7 +2654,10 @@ Output the report content directly, no extra commentary.
         ][:8]
 
         if template_language == "en":
-            data_scope_section = self._build_data_scope_report_block(overview)
+            data_scope_section = self._build_data_scope_report_block(overview).replace(
+                "### 1. Data Scope",
+                "### Data Scope",
+            )
             data_gap_section = self._build_data_gap_input_block(overview).replace("## Data Gaps", "### Data Gaps")
             stats_section = ""
             if self.profile.has_market_stats:
@@ -2670,7 +2673,7 @@ Output the report content directly, no extra commentary.
                         one_price=self._format_prompt_ratio(sentiment.get("one_price_like_ratio")),
                     )
                 stats_section = f"""
-### 4. Sentiment Temperature
+### 3. Breadth & Liquidity
 | Metric | Value |
 |--------|-------|
 | Advancers | {overview.up_count} |
@@ -2690,7 +2693,7 @@ Output the report content directly, no extra commentary.
                     for item in theme_candidates
                 )
                 sector_section = f"""
-### 5. Theme Ranking
+### 4. Sector / Theme Highlights
 - **Industry Leaders**: {top_text or "N/A"}
 - **Industry Laggards**: {bottom_text or "N/A"}
 - **Concept Leaders**: {top_concept_text or "N/A"}
@@ -2717,23 +2720,25 @@ Output the report content directly, no extra commentary.
 
 {data_gap_section}
 
-### 2. Market Summary
+### 1. Market Summary
 Today's {self._get_market_scope_name(template_language)} showed **{market_mood}**.
 
-### 3. Index Risk Gates
+### 2. Major Indices
 {indices_text or "- No index data available"}
 {stats_section}
 {sector_section}
 
-### 6. Core Watchlist
-{watchlist_lines or "- No verifiable stock-level watchlist is available without leader/capacity/trend stock inputs."}
+### 5. News / Catalysts
+- No usable news lowers confidence in theme-continuation conclusions.
 
-### 7. Next-Session Strategy
+### 6. Strategy Framework
+- Core watchlist:
+{watchlist_lines or "  - No verifiable stock-level watchlist is available without leader/capacity/trend stock inputs."}
 - Avoid chasing unconfirmed one-day movers.
 - Raise exposure only after index confirmation and theme continuation are both visible.
 - Use trial positions first when leadership evidence is incomplete.
 
-### 8. Risk Alerts
+### 7. Risk Alerts
 Market conditions can change quickly. The data above is for reference only and does not constitute investment advice.
 
 ---
@@ -2743,7 +2748,10 @@ Market conditions can change quickly. The data above is for reference only and d
 
         market_labels = {"cn": "A股", "us": "美股", "hk": "港股", "jp": "日股", "kr": "韩股"}
         market_label = market_labels.get(self.region, "A股")
-        data_scope_section = self._build_data_scope_report_block(overview)
+        data_scope_section = self._build_data_scope_report_block(overview).replace(
+            "### 一、数据口径",
+            "### 数据口径",
+        )
         data_gap_section = self._build_data_gap_input_block(overview).replace("## 数据缺口", "### 数据缺口")
         dashboard_block = self._build_stats_block(overview) if self.profile.has_market_stats else ""
         indices_block = self._build_indices_block(overview)
@@ -2755,7 +2763,7 @@ Market conditions can change quickly. The data above is for reference only and d
         )
         sector_section = (
             f"""
-### 五、热点排序
+### 四、板块主线
 {sector_block or "- 暂无板块涨跌榜数据。"}
 """
             if self.profile.has_sector_rankings
@@ -2763,7 +2771,7 @@ Market conditions can change quickly. The data above is for reference only and d
         )
         funds_section = (
             f"""
-### 四、情绪温度
+### 三、资金与情绪
 {dashboard_block or "- 暂无市场宽度数据。"}
 
 - 结合成交额和涨跌家数看，当前更适合等待确认，避免仅凭单一热点追高。
@@ -2804,10 +2812,10 @@ Market conditions can change quickly. The data above is for reference only and d
 
 {data_gap_section}
 
-### 二、盘面总览
+### 一、盘面总览
 - 当前复盘先按大盘快照处理，只有指数与热点持续性同时确认后，才升级为可执行进攻策略。
 
-### 三、大盘风险门槛
+### 二、指数结构
 {indices_block or indices_text or "暂无指数数据。"}
 
 {funds_section}
@@ -2815,20 +2823,20 @@ Market conditions can change quickly. The data above is for reference only and d
 {sector_section}
 {ranked_theme_lines}
 
-### 六、消息催化
+### 五、消息催化
 - 暂无可用新闻时，应降低对题材持续性的确定性判断。
 
-### 七、核心观察票
-{watchlist_lines or "- 暂无可验证观察票：当前未提供情绪龙头、容量核心、前排和低位补涨清单。"}
-
-### 八、明日交易计划
+### 六、策略框架
+- 核心观察票：
+{watchlist_lines or "  - 暂无可验证观察票：当前未提供情绪龙头、容量核心、前排和低位补涨清单。"}
+- 明日交易计划：
 - 不能买：单日冲高、无板块支撑、缺少成交确认的后排跟风。
 - 确认条件：指数不转弱，候选热点有前排继续封板或容量核心承接。
 - 买点类型：确认后的回踩承接、放量突破或分歧转一致，不做无确认追高。
 - 失效位：指数转弱、上涨家数收缩、跌停扩散或热点前排断板负反馈。
 - 仓位上限：主线未确认前以观察/试错仓为主，确认后再逐步加仓。
 
-### 九、风险提示
+### 七、风险提示
 - 市场有风险，投资需谨慎。以上数据仅供参考，不构成投资建议。
 
 ---

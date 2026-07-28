@@ -26,8 +26,15 @@ from src.report_language import (
     is_chip_structure_unavailable,
     localize_bias_status,
     localize_chip_health,
+    localize_conflict_severity,
+    localize_consensus_level,
+    localize_strategy_signal,
+    localize_strategy_skill,
+    localize_strategy_synthesis_summary,
     localize_trend_prediction,
     normalize_report_language,
+    normalize_strategy_synthesis_payload,
+    strategy_invalid_opinion_count,
 )
 from src.storage import DatabaseManager
 from src.services.run_diagnostics import build_run_diagnostic_summary
@@ -301,6 +308,20 @@ class HistoryService:
             context_snapshot,
         )
 
+    @staticmethod
+    def _extract_market_review_region(context_snapshot: Any) -> Optional[str]:
+        snapshot = parse_json_field(context_snapshot)
+        if not isinstance(snapshot, dict):
+            return None
+
+        region = snapshot.get("market_review_region")
+        if not isinstance(region, str):
+            payload = snapshot.get("market_review_payload")
+            region = payload.get("region") if isinstance(payload, dict) else None
+
+        normalized = region.strip() if isinstance(region, str) else ""
+        return normalized or None
+
     def _record_to_list_item_dict(self, record) -> Dict[str, Any]:
         raw_result = parse_json_field(getattr(record, "raw_result", None))
         model_used = raw_result.get("model_used") if isinstance(raw_result, dict) else None
@@ -320,6 +341,9 @@ class HistoryService:
             "stock_code": display_code,
             "stock_name": record.name,
             "report_type": record.report_type,
+            "region": self._extract_market_review_region(
+                getattr(record, "context_snapshot", None)
+            ),
             "trend_prediction": record.trend_prediction,
             "analysis_summary": record.analysis_summary,
             "sentiment_score": record.sentiment_score,
@@ -1160,6 +1184,51 @@ class HistoryService:
                 report_lines.append(f"**🐻 {labels.get('strongest_bearish_signal_label', '最强看空信号')}**: {bearish}")
             report_lines.append("")
 
+        # ========== 多策略综合 ==========
+        strategy_synthesis = normalize_strategy_synthesis_payload(
+            dashboard.get('strategy_synthesis') if dashboard else None
+        )
+        if strategy_synthesis:
+            confidence = strategy_synthesis.get('confidence')
+            confidence_text = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else "N/A"
+            report_lines.extend([
+                f"### 🧩 {labels.get('strategy_synthesis_heading', '多策略综合')}",
+                "",
+                (
+                    f"- {labels.get('strategy_final_signal_label', '综合信号')}: "
+                    f"{localize_strategy_signal(strategy_synthesis.get('final_signal', 'N/A'), report_language)} | "
+                    f"{labels.get('strategy_consensus_level_label', '共识度')}: "
+                    f"{localize_consensus_level(strategy_synthesis.get('consensus_level', 'N/A'), report_language)} | "
+                    f"{labels.get('strategy_conflict_label', '冲突')}: "
+                    f"{localize_conflict_severity(strategy_synthesis.get('conflict_severity', 'none'), report_language)} "
+                    f"({strategy_synthesis.get('conflict_count', 0)}) | "
+                    f"{labels.get('strategy_confidence_label', '置信度')}: {confidence_text}"
+                ),
+            ])
+            summary = localize_strategy_synthesis_summary(strategy_synthesis, report_language)
+            if summary:
+                report_lines.append(f"- {labels.get('strategy_summary_label', '综合说明')}: {summary}")
+            report_lines.append(
+                f"- {labels.get('strategy_supporting_skills_label', '支持策略')}: "
+                f"{self._format_strategy_skill_items(strategy_synthesis.get('supporting_skills'), report_language)}"
+            )
+            report_lines.append(
+                f"- {labels.get('strategy_opposing_skills_label', '反方策略')}: "
+                f"{self._format_strategy_skill_items(strategy_synthesis.get('opposing_skills'), report_language)}"
+            )
+            invalid_count = strategy_invalid_opinion_count(strategy_synthesis)
+            if invalid_count:
+                invalid_label_template = labels.get(
+                    "strategy_invalid_opinions_label",
+                    "另有 {count} 个策略解析失败",
+                )
+                try:
+                    invalid_text = invalid_label_template.format(count=invalid_count)
+                except (KeyError, IndexError):
+                    invalid_text = f"{invalid_label_template}: {invalid_count}"
+                report_lines.append(f"- {invalid_text}")
+            report_lines.append("")
+
         # ========== 如果没有 dashboard，显示传统格式 ==========
         if not dashboard:
             # 操作理由
@@ -1201,6 +1270,26 @@ class HistoryService:
         ])
 
         return "\n".join(report_lines)
+
+    @staticmethod
+    def _format_strategy_skill_items(items: Any, report_language: str = "zh") -> str:
+        none_text = get_report_labels(report_language).get("none_label", "None")
+        if not isinstance(items, list):
+            return none_text
+        formatted: List[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            skill_id = str(item.get("skill_id") or "").strip()
+            signal = str(item.get("signal") or "").strip()
+            confidence = item.get("confidence")
+            if not skill_id:
+                continue
+            suffix = f"/{localize_strategy_signal(signal, report_language)}" if signal else ""
+            if isinstance(confidence, (int, float)):
+                suffix += f"/{confidence:.0%}"
+            formatted.append(f"{localize_strategy_skill(skill_id, report_language)}{suffix}")
+        return "、".join(formatted) if formatted else none_text
 
     @staticmethod
     def _escape_md(text: Optional[str]) -> str:
