@@ -182,13 +182,13 @@ class SectionHintTestCase(unittest.TestCase):
         analyzer = _build_analyzer("cn")
         sections = analyzer._build_output_template_sections("zh")
 
-        self.assertIn("联动关系", sections)
-        self.assertIn("谁在打谁、资金从哪来到哪去", sections)
-        self.assertIn("先判断当日走势是否由外围事件驱动", sections)
-        self.assertIn("资金净流入/流出榜与涨跌幅榜交叉验证", sections)
-        self.assertIn("结合涨停结构（连板高度、炸板情况）", sections)
-        self.assertIn("触发失效条件必须引用已提供的可观察锚点", sections)
-        self.assertIn("禁止使用\"若市场走弱\"这类不可验证表述", sections)
+        self.assertIn("市场热度与风险状态", sections)
+        self.assertIn("不能买什么", sections)
+        self.assertIn("confirmed_mainline 与 mainline_candidate 合计最多三个", sections)
+        self.assertIn("指数、情绪、容量核心、前排换手与外围修复条件", sections)
+        self.assertIn("observation_only 情绪温度计", sections)
+        self.assertIn("逐票写触发、确认、失效与仓位上限", sections)
+        self.assertIn("position_mode 和数字仓位上限", sections)
 
 
 if __name__ == "__main__":

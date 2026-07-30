@@ -451,8 +451,8 @@ daily_stock_analysis/
 > - TickFlow 可通过申万一级行业标的池与全 A 股行情生成行业涨跌排行，并优先参与市场结构行业主线 fallback；概念题材排行仍由现有 AkShare / Tushare / Efinance 链路提供。
 > - TickFlow 官方 quickstart 提供了 `quotes.get(universes=["CN_Equity_A"])` 用法，但不同 API Key 不一定拥有对应权限；批量日 K、深度和财务等能力也按权限 fail-open。
 > - TickFlow 实际返回的 `change_pct` / `amplitude` 为比例值；系统已在接入层统一转换为百分比值，确保与现有数据源字段语义一致。
-> - A 股大盘复盘报告采用盘后工作台式结构：固定包含盘面信号、指数明细、板块 Top 表、近三日市场线索、明日交易计划和风险提示；盘面信号以 `66/100（偏暖，可进攻）` 这类纯文本分数表达，避免色块进度条在不同终端显示不一致；近三日市场线索只列标题、来源和链接，不再展示搜索摘要片段；若部分数据源缺失，则保留可用区块并在对应位置降级展示。
-> - A 股复盘会额外生成版本化 `a_share_evidence` 证据：涨停、炸板、昨日涨停和跌停事件池均按实际交易日请求，指数日线本地计算 MA5/MA10/MA20 与 20 日区间，并交叉形成炸板率、昨日涨停溢价、连板梯队、疑似一字板比例、题材候选和核心观察票。该证据随结构化复盘 payload 写入历史记录；`DAILY_MARKET_CONTEXT_ENABLED=true` 时，仅将白名单裁剪后的情绪指标、前三题材和前五观察票注入个股分析，并在炸板率过高、昨日涨停溢价为负或成长指数跌破短均线时复用现有保守仓位护栏。任一日期化数据源失败都按 `data_quality` 显式降级，不会中断其他市场或复盘主流程。
+> - A 股大盘复盘报告采用九段式盘后工作台结构，先区分市场热度与确定性风险状态，再依次给出指数/旧主线/外围风险、不能买什么、最多三个可操作方向、升级条件、观察票交易资格、仓位上限和未验证项。热度分数只描述普涨与活跃度，不再附带“可进攻”；风险状态由五指数 MA5/MA10/MA20、情绪质量、容量核心/可交易前排和外围科技共同决定。近三日市场线索仍只列标题、来源和链接；缺失数据会降低风险上限，不会被模型文案升级。
+> - A 股复盘会额外生成版本化 `a_share_evidence` 和 `normalized_review_snapshot`：涨停、炸板、昨日涨停和跌停事件池均按实际交易日请求，五个主要指数主动拉取日线并本地计算 MA5/MA10/MA20 与 20 日区间，外围科技引用带时间戳的纳指和半导体代理。日期化情绪口径覆盖概览近似值；可操作方向合计最多三个；一字或严重缩量票只作为 `observation_only` 情绪温度计。Prompt、Markdown、历史 payload、通知和 `daily_market_context` 共用该快照，持久化前若发现数字或风险措辞矛盾会回退为保守模板。完整字段和算法见 [A 股大盘复盘数据与风险契约](a-share-market-review-contract.md)。
 > - 字段契约：
 >   - `fundamental_context.belong_boards` = 个股关联板块列表；A 股从 AkShare 板块名单写入，美股/港股从 yfinance `info.sector` / `info.industry` 写入，无数据时为 `[]`；
 >   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`，HK/US 当前不提供）；

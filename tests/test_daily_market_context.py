@@ -1247,3 +1247,37 @@ def test_daily_market_context_carries_bounded_a_share_evidence_and_guardrails() 
     assert "题材候选" in section
     assert "候选0" in section
     assert section.index("候选0") < section.index("END_UNTRUSTED_MARKET_SUMMARY")
+
+
+def test_daily_market_context_prefers_structured_risk_state_and_position_cap() -> None:
+    context = DailyMarketContextService(
+        db_manager=MagicMock(),
+        today_fn=lambda: date(2026, 7, 30),
+    )._build_context_from_payload(
+        region="cn",
+        trade_date=date(2026, 7, 29),
+        payload={
+            "summary": "市场热度较高，但风险门槛未通过。",
+            "normalized_review_snapshot": {
+                "risk_assessment": {
+                    "risk_state": "red",
+                    "position_mode": "defense_only",
+                    "position_cap_pct": 10,
+                    "triggered_gates": ["external_tech_veto", "index_trend_weak"],
+                }
+            },
+        },
+        source="analysis_history",
+    )
+
+    assert context is not None
+    safe_payload = context.to_safe_dict()
+    assert safe_payload["risk_state"] == "red"
+    assert safe_payload["position_cap_pct"] == 10
+    assert safe_payload["position_cap"] == "10%"
+    assert "high_risk" in safe_payload["risk_tags"]
+    assert "external_tech_veto" in safe_payload["risk_tags"]
+
+    section = format_daily_market_context_prompt_section(safe_payload, report_language="zh")
+    assert "确定性风险状态：red" in section
+    assert "仓位上限：10%" in section

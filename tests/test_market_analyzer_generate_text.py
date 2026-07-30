@@ -11,6 +11,7 @@ Covers:
 """
 import json
 import sys
+from pathlib import Path
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -2974,7 +2975,8 @@ Sector text.
 
         result = ma._inject_data_into_review(review, overview)
 
-        assert "- **Market Signal**: 66/100 (constructive, risk-on)" in result
+        assert "- **Market heat**: 65/100 (constructive)" in result
+        assert "- **Risk state**: green" in result
         assert "- **Breadth**: Advancers 3200 / Decliners 1800 / Flat 100;" in result
         assert "Turnover 14567 (CNY 100m)" in result
         assert "| Index | Last | Change % | Open | High | Low | Amplitude | Turnover (CNY 100m) |" in result
@@ -3030,16 +3032,19 @@ Sector text.
 
         result = ma._inject_data_into_review(review, overview, news)
 
-        assert "盘面信号" in result
-        assert "66/100（偏暖，可进攻）" in result
+        assert "市场热度" in result
+        assert "风险状态" in result
+        assert "65/100（偏暖）" in result
         assert "绿灯（可进攻）" not in result
         assert "大盘红绿灯" not in result
         assert "green（可进攻）" not in result
         assert "信号依据" in result
-        signal_line = next(line for line in result.splitlines() if "**盘面信号**" in line)
+        heat_line = next(line for line in result.splitlines() if "**市场热度**" in line)
+        signal_line = next(line for line in result.splitlines() if "**风险状态**" in line)
         drivers_line = next(line for line in result.splitlines() if "**信号依据**" in line)
         assert signal_line.startswith("- ")
-        assert "66/100" in signal_line
+        assert "65/100" in heat_line
+        assert "仓位上限" in signal_line
         assert "█" not in result
         assert "░" not in result
         assert "盘面温度" not in drivers_line
@@ -3209,13 +3214,13 @@ Sector text.
         snapshot = ma.build_market_light_snapshot(overview)
 
         assert snapshot["status"] == "red"
-        assert snapshot["label"] == "偏防守"
+        assert snapshot["label"] == "防守/不开高风险新仓"
         assert snapshot["score"] < 40
         assert snapshot["region"] == "cn"
         assert snapshot["trade_date"] == "2026-03-06"
-        assert snapshot["data_quality"] == "ok"
+        assert snapshot["data_quality"] == "unavailable"
         assert snapshot["dimensions"]["breadth"]["available"] is True
-        assert snapshot["dimensions"]["index"]["available"] is True
+        assert snapshot["dimensions"]["index"]["available"] is False
         assert snapshot["dimensions"]["limit"]["available"] is True
         assert any("亏钱效应" in reason for reason in snapshot["reasons"])
 
@@ -3242,7 +3247,7 @@ Sector text.
         assert snapshot["status"] == "red"
         assert snapshot["label"] == "risk-off"
         assert snapshot["guidance"] == (
-            "Risk is elevated; prioritize drawdown control and avoid chasing weak rebounds."
+            "A risk veto is active; prioritize drawdown control and avoid new high-beta exposure."
         )
         assert not any(reason.startswith("market temperature ") for reason in snapshot["reasons"])
         assert any(
@@ -3502,3 +3507,148 @@ Sector text.
         assert violations == [], (
             f"market_analyzer.py still accesses private Analyzer attributes: {violations}"
         )
+
+
+def _review_20260729_overview():
+    from src.market_analyzer import MarketIndex, MarketOverview
+
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "a_share_review_20260729.json").read_text(encoding="utf-8")
+    )
+    index_trend = []
+    indices = []
+    for item in fixture["indices"]:
+        indices.append(
+            MarketIndex(
+                code=item["code"],
+                name=item["name"],
+                current=item["current"],
+                change_pct=item["change_pct"],
+                as_of=fixture["trade_date"],
+            )
+        )
+        index_trend.append(
+            {
+                "code": item["symbol"],
+                "name": item["name"],
+                "current": item["current"],
+                "change_pct": item["change_pct"],
+                "ma5": item["current"] + 4,
+                "ma10": item["current"] + 6,
+                "ma20": item["current"] + 8,
+                "dist_ma5_pct": -3.5,
+                "dist_ma10_pct": -5.5,
+                "dist_ma20_pct": -7.0,
+                "trade_date": fixture["trade_date"],
+                "as_of": fixture["trade_date"],
+                "status": "ok",
+                "current_source": "runtime_snapshot",
+            }
+        )
+    sentiment = dict(fixture["canonical_sentiment"])
+    evidence = {
+        "schema_version": "a-share-review-evidence-v2",
+        "status": "ok",
+        "trade_date": fixture["trade_date"],
+        "index_trend": index_trend,
+        "sentiment_structure": sentiment,
+        "theme_candidates": [
+            {
+                "theme": "CPO",
+                "classification": "mainline_candidate",
+                "actionable": True,
+                "capacity_core_present": True,
+                "tradeable_front_present": True,
+                "position_cap_pct": 10,
+                "change_pct": 3.2,
+                "confirmation": "板块强于沪深300且容量核心不破当日低点",
+                "invalidation": "板块转负或容量核心跌破当日低点",
+            },
+            {"theme": "PCB", "classification": "observation_only", "actionable": False, "change_pct": -3.1},
+            {"theme": "半导体", "classification": "observation_only", "actionable": False, "change_pct": -2.4},
+            {"theme": "消费链", "classification": "rotation_or_defense", "actionable": False, "change_pct": 4.8, "capacity_core_present": False},
+        ],
+        "stock_candidates": [
+            {
+                "code": "603221",
+                "name": "爱丽家居",
+                "role": "emotion_thermometer",
+                "trade_eligibility": "observation_only",
+                "trigger_type": "无交易触发",
+                "confirmation_conditions": ["出现充分换手"],
+                "invalidation": "情绪高度下降",
+                "position_cap_pct": 0,
+            }
+        ],
+        "external_tech_context": {
+            "status": "ok",
+            "as_of": "2026-07-29",
+            "nasdaq_change_pct": -2.1,
+            "semiconductor_proxy_change_pct": -4.5,
+            "source": "fixture",
+        },
+        "risk_rules": [
+            {"code": "growth_index_below_short_ma", "triggered": True, "evidence": "创业板指、科创50位于MA5或MA10下方", "action": "降级"},
+            {"code": "external_tech_negative", "triggered": True, "evidence": "纳指-2.10%，半导体代理-4.50%", "action": "否决"},
+        ],
+        "risk_tags": ["growth_index_below_short_ma", "external_tech_negative"],
+        "data_quality": {"status": "ok", "missing_fields": [], "contaminated_fields": [], "errors": []},
+    }
+    return MarketOverview(
+        date=fixture["trade_date"],
+        generated_at=fixture["generated_at"],
+        run_date="2026-07-30",
+        data_date=fixture["trade_date"],
+        indices=indices,
+        up_count=4252,
+        down_count=1215,
+        flat_count=66,
+        limit_up_count=81,
+        limit_down_count=9,
+        total_amount=19300,
+        a_share_evidence=evidence,
+        index_key_levels=index_trend,
+    ), fixture
+
+
+def test_20260729_high_heat_is_overridden_by_external_tech_risk_gate():
+    from src.market_analyzer import MarketAnalyzer
+
+    with patch("src.market_analyzer.DataFetcherManager"):
+        analyzer = MarketAnalyzer(region="cn", config=SimpleNamespace(report_language="zh"))
+    overview, _ = _review_20260729_overview()
+    risk = analyzer._build_a_share_risk_assessment(overview, overview.a_share_evidence)
+    overview.a_share_evidence["risk_assessment"] = risk
+    overview.normalized_review_snapshot = analyzer._build_normalized_review_snapshot(
+        overview,
+        overview.a_share_evidence,
+        risk,
+    )
+    snapshot = analyzer.build_market_light_snapshot(overview)
+
+    assert snapshot["market_heat_score"] >= 70
+    assert snapshot["risk_state"] == "red"
+    assert snapshot["position_cap_pct"] == 10
+    assert "external_tech_veto" in snapshot["triggered_gates"]
+    stats_block = analyzer._build_stats_block(overview)
+    assert "昨日涨停溢价中位数 +0.42%" in stats_block
+    assert "仍未提供昨日涨停溢价" not in stats_block
+
+
+def test_a_share_major_index_average_requires_five_indices():
+    from src.market_analyzer import MarketAnalyzer, MarketIndex, MarketOverview
+
+    with patch("src.market_analyzer.DataFetcherManager"):
+        analyzer = MarketAnalyzer(region="cn", config=SimpleNamespace(report_language="zh"))
+    overview = MarketOverview(
+        date="2026-07-29",
+        indices=[MarketIndex(code="sh000001", name="上证指数", current=3500, change_pct=0.4)],
+        a_share_evidence={"index_trend": [{"name": "上证指数", "change_pct": 0.4}]},
+    )
+
+    reasons = analyzer._build_market_light_reasons_zh(overview, 60)
+    scores = analyzer._build_market_light_scores(overview)
+
+    assert "主要指数仅覆盖 1/5，不计算平均涨跌幅" in reasons
+    assert not any("主要指数平均涨跌幅" in reason for reason in reasons)
+    assert scores["dimensions"]["index"] == {"score": 50, "available": False}

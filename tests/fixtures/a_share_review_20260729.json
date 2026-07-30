@@ -1,0 +1,89 @@
+{
+  "trade_date": "2026-07-29",
+  "generated_at": "2026-07-30T08:30:00+08:00",
+  "market_stats": {
+    "up_count": 4252,
+    "down_count": 1215,
+    "flat_count": 66,
+    "limit_up_count": 83,
+    "limit_down_count": 13,
+    "total_amount": 19300.0
+  },
+  "canonical_sentiment": {
+    "limit_up_count": 81,
+    "broken_board_count": 14,
+    "limit_down_count": 9,
+    "broken_ratio": 0.1474,
+    "previous_limit_sample_count": 61,
+    "previous_limit_premium_mean_pct": 0.65,
+    "previous_limit_premium_median_pct": 0.42,
+    "highest_consecutive_board": 7
+  },
+  "indices": [
+    {
+      "code": "sh000001",
+      "symbol": "000001",
+      "name": "上证指数",
+      "current": 101.0,
+      "change_pct": 0.4,
+      "history_closes": [110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 100, 101]
+    },
+    {
+      "code": "sz399001",
+      "symbol": "399001",
+      "name": "深证成指",
+      "current": 101.1,
+      "change_pct": 1.1,
+      "history_closes": [112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 100, 101.1]
+    },
+    {
+      "code": "sz399006",
+      "symbol": "399006",
+      "name": "创业板指",
+      "current": 101.55,
+      "change_pct": 1.55,
+      "history_closes": [115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 115, 100, 101.55]
+    },
+    {
+      "code": "sh000688",
+      "symbol": "000688",
+      "name": "科创50",
+      "current": 99.13,
+      "change_pct": -0.87,
+      "history_closes": [114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 114, 100, 99.13]
+    },
+    {
+      "code": "sh000300",
+      "symbol": "000300",
+      "name": "沪深300",
+      "current": 100.67,
+      "change_pct": 0.67,
+      "history_closes": [108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 108, 100, 100.67]
+    }
+  ],
+  "sector_rankings": {
+    "top": [
+      {"name": "饮料乳品", "change_pct": 4.8},
+      {"name": "CPO", "change_pct": 3.2},
+      {"name": "化学制品", "change_pct": 2.6}
+    ],
+    "bottom": [
+      {"name": "PCB", "change_pct": -3.1},
+      {"name": "半导体", "change_pct": -2.4}
+    ]
+  },
+  "concept_rankings": {
+    "top": [
+      {"name": "低空经济", "change_pct": 2.2},
+      {"name": "机器人", "change_pct": 1.9}
+    ],
+    "bottom": [
+      {"name": "存储芯片", "change_pct": -2.0}
+    ]
+  },
+  "external_indices": [
+    {"code": "IXIC", "name": "纳斯达克", "current": 21000.0, "change_pct": -2.1, "as_of": "2026-07-29", "provider": "fixture"},
+    {"code": "SOX", "name": "费城半导体指数", "current": 5400.0, "change_pct": -4.5, "as_of": "2026-07-29", "provider": "fixture"}
+  ],
+  "legacy_conflicting_report": "## 2026-07-29 A股大盘复盘\n\n### 二、盘面总览\n上涨4252家，涨停83家、跌停13家。昨日涨停溢价中位数+0.42%，但仍未提供昨日涨停溢价。主要指数平均涨跌幅+0.40%。市场71/100，强势，可进攻。\n\n### 五、热点排序\n饮料乳品为确定性第一主线。\n\n### 六、核心观察票\n爱丽家居可做弱转强买点。"
+}

@@ -2515,7 +2515,11 @@ class DataFetcherManager:
                 data = getter()
                 if data:
                     logger.info(f"[{fetcher.name}] 获取外围市场指数成功")
-                    return data
+                    return [
+                        {**dict(item), "provider": fetcher.name}
+                        for item in data
+                        if isinstance(item, dict)
+                    ]
             except Exception as e:
                 logger.warning(f"[{fetcher.name}] 获取外围市场指数失败: {e}")
                 continue
@@ -2531,7 +2535,11 @@ class DataFetcherManager:
                 data = getter(symbol, days=days)
                 if data:
                     logger.info(f"[{fetcher.name}] 获取指数日线成功")
-                    return data
+                    return [
+                        {**dict(item), "provider": fetcher.name}
+                        for item in data
+                        if isinstance(item, dict)
+                    ]
             except Exception as e:
                 logger.warning(f"[{fetcher.name}] 获取指数日线失败: {e}")
                 continue
@@ -2553,7 +2561,7 @@ class DataFetcherManager:
                         purpose,
                         elapsed,
                     )
-                    return data
+                    return {**dict(data), "_provider": "TickFlowFetcher"}
                 logger.info(
                     "[MarketStats] component=market_stats action=provider_empty "
                     "purpose=%s provider=TickFlowFetcher elapsed=%.2fs",
@@ -2585,7 +2593,7 @@ class DataFetcherManager:
                         fetcher.name,
                         elapsed,
                     )
-                    return data
+                    return {**dict(data), "_provider": fetcher.name}
                 logger.info(
                     "[MarketStats] component=market_stats action=provider_empty "
                     "purpose=%s provider=%s elapsed=%.2fs",

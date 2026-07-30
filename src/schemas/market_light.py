@@ -42,3 +42,11 @@ class MarketLightSnapshot(BaseModel):
     guidance: str
     dimensions: MarketLightDimensions
     data_quality: MarketLightDataQuality
+    market_heat_score: int = Field(default=50, ge=0, le=100)
+    raw_heat_score: int = Field(default=50, ge=0, le=100)
+    raw_heat_label: str = "unknown"
+    risk_state: MarketLightStatus = "yellow"
+    position_mode: str = "confirmation_trial"
+    position_cap_pct: int = Field(default=30, ge=0, le=100)
+    triggered_gates: list[str] = Field(default_factory=list)
+    gate_evidence: list[str] = Field(default_factory=list)

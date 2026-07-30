@@ -201,10 +201,19 @@ def _append_softening_limitation(phase_decision: dict[str, Any], *, language: st
 def _is_conservative_context(context: Any) -> bool:
     if not isinstance(context, Mapping):
         return False
+    risk_state = str(context.get("risk_state") or "").strip().lower()
+    if risk_state in {"red", "yellow"}:
+        return True
+    try:
+        position_cap_pct = int(context.get("position_cap_pct"))
+    except (TypeError, ValueError):
+        position_cap_pct = None
+    if position_cap_pct is not None and position_cap_pct <= 30:
+        return True
     tags = context.get("risk_tags")
     if isinstance(tags, list) and any(str(tag) in _CONSERVATIVE_TAGS for tag in tags):
         return True
-    if str(context.get("position_cap") or "").strip():
+    if not risk_state and str(context.get("position_cap") or "").strip():
         return True
     summary = str(context.get("summary") or "")
     lowered = summary.lower()

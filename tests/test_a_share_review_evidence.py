@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import sys
+import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,7 +15,7 @@ import pandas as pd
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import BaseFetcher, DataFetcherManager
 from src.market_analyzer import MarketAnalyzer, MarketIndex, MarketOverview
-from src.services.a_share_review_evidence import AShareReviewEvidenceService
+from src.services.a_share_review_evidence import AShareReviewEvidenceService, _bars_through_trade_date
 
 
 def _bars(base: float = 100.0) -> list[dict]:
@@ -82,6 +84,14 @@ class _EvidenceManager:
 
 
 class AShareReviewEvidenceServiceTestCase(unittest.TestCase):
+    def test_index_history_drops_bars_after_target_trade_date(self) -> None:
+        bars = [
+            {"date": "2026-07-30", "close": 101},
+            {"date": "2026-07-31", "close": 102},
+        ]
+
+        self.assertEqual(_bars_through_trade_date(bars, "20260729"), [])
+
     def test_builds_sentiment_themes_watchlist_and_risk_gates(self) -> None:
         manager = _EvidenceManager()
         service = AShareReviewEvidenceService(manager)
@@ -89,9 +99,9 @@ class AShareReviewEvidenceServiceTestCase(unittest.TestCase):
         evidence = service.build(
             trade_date="20260717",
             indices=[
-                {"code": "sh000001", "name": "上证指数", "current": 121.0},
-                {"code": "sz399006", "name": "创业板指", "current": 205.0},
-                {"code": "sh000688", "name": "科创50", "current": 204.0},
+                {"code": "sh000001", "name": "上证指数", "current": 121.0, "as_of": "2026-07-17"},
+                {"code": "sz399006", "name": "创业板指", "current": 205.0, "as_of": "2026-07-17"},
+                {"code": "sh000688", "name": "科创50", "current": 204.0, "as_of": "2026-07-17"},
             ],
             sector_rankings={
                 "top": [{"name": "半导体", "change_pct": 4.2}],
@@ -102,6 +112,10 @@ class AShareReviewEvidenceServiceTestCase(unittest.TestCase):
                 "bottom": [{"name": "转基因", "change_pct": -0.8}],
             },
             market_snapshot={"up_count": 3000, "down_count": 1800, "flat_count": 100},
+            global_indices=[
+                {"code": "IXIC", "name": "纳斯达克", "change_pct": 0.3, "as_of": "2026-07-17"},
+                {"code": "SOX", "name": "费城半导体指数", "change_pct": 0.5, "as_of": "2026-07-17"},
+            ],
         )
 
         sentiment = evidence["sentiment_structure"]
@@ -119,7 +133,213 @@ class AShareReviewEvidenceServiceTestCase(unittest.TestCase):
         self.assertIn("high_broken_board_ratio", evidence["risk_tags"])
         self.assertIn("negative_previous_limit_premium", evidence["risk_tags"])
         self.assertIn("growth_index_below_short_ma", evidence["risk_tags"])
-        self.assertEqual(evidence["data_quality"]["status"], "ok")
+        self.assertEqual(evidence["data_quality"]["status"], "partial")
+        self.assertIn("index_trend_as_of:399001", evidence["data_quality"]["missing_fields"])
+
+    def test_20260729_fixture_uses_canonical_sentiment_five_indices_and_theme_caps(self) -> None:
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "a_share_review_20260729.json").read_text(encoding="utf-8")
+        )
+
+        class FixtureManager:
+            def __init__(self) -> None:
+                limit_up = [
+                    {
+                        "code": "603221",
+                        "name": "爱丽家居",
+                        "industry": "CPO",
+                        "change_pct": 10,
+                        "amount": 1_000_000_000,
+                        "turnover_rate": 0.2,
+                        "consecutive_boards": 7,
+                        "first_limit_time": "092500",
+                        "break_count": 0,
+                    },
+                    {
+                        "code": "300001",
+                        "name": "CPO容量",
+                        "industry": "CPO",
+                        "change_pct": 10,
+                        "amount": 8_000_000_000,
+                        "turnover_rate": 8,
+                        "consecutive_boards": 2,
+                        "first_limit_time": "100100",
+                        "break_count": 1,
+                    },
+                    {
+                        "code": "600101",
+                        "name": "化工容量",
+                        "industry": "化学原料",
+                        "change_pct": 10,
+                        "amount": 7_000_000_000,
+                        "turnover_rate": 12,
+                        "consecutive_boards": 3,
+                        "first_limit_time": "101000",
+                        "break_count": 0,
+                    },
+                ]
+                filler_industries = ["低空经济", "机器人", "化学制品", "CPO"]
+                for index in range(78):
+                    limit_up.append(
+                        {
+                            "code": f"60{index + 1000:04d}",
+                            "name": f"样本{index + 1}",
+                            "industry": filler_industries[index % len(filler_industries)],
+                            "change_pct": 10,
+                            "amount": 1_500_000_000 + index * 10_000_000,
+                            "turnover_rate": 6,
+                            "consecutive_boards": 2 if index < 8 else 1,
+                            "first_limit_time": "101500",
+                            "break_count": 0,
+                        }
+                    )
+                premiums = [0.42] * 31 + [0.8866667] * 30
+                self.pools = {
+                    "limit_up": limit_up,
+                    "broken_board": [{"code": f"B{index}"} for index in range(14)],
+                    "previous_limit": [{"change_pct": value} for value in premiums],
+                    "limit_down": [{"code": f"D{index}"} for index in range(9)],
+                }
+                self.histories = {
+                    item["symbol"]: [
+                        {
+                            "date": f"2026-07-{day + 9:02d}",
+                            "open": close,
+                            "high": close + 1,
+                            "low": close - 1,
+                            "close": close,
+                            "provider": "fixture",
+                        }
+                        for day, close in enumerate(item["history_closes"])
+                    ]
+                    for item in fixture["indices"]
+                }
+
+            def get_limit_event_pool_with_meta(self, pool_type: str, date: str, n: int):
+                rows = self.pools[pool_type]
+                return rows, [{"provider": "fixture", "status": "ok"}], ""
+
+            def get_index_daily_history(self, symbol: str, days: int = 30):
+                return self.histories[symbol]
+
+        manager = FixtureManager()
+        evidence = AShareReviewEvidenceService(manager).build(
+            trade_date="20260729",
+            indices=[
+                {
+                    "code": item["code"],
+                    "name": item["name"],
+                    "current": item["current"],
+                    "change_pct": item["change_pct"],
+                    "as_of": fixture["trade_date"],
+                }
+                for item in fixture["indices"]
+            ],
+            sector_rankings=fixture["sector_rankings"],
+            concept_rankings=fixture["concept_rankings"],
+            market_snapshot=fixture["market_stats"],
+            global_indices=fixture["external_indices"],
+        )
+
+        sentiment = evidence["sentiment_structure"]
+        self.assertEqual(sentiment["limit_up_count"], 81)
+        self.assertEqual(sentiment["broken_board_count"], 14)
+        self.assertEqual(sentiment["limit_down_count"], 9)
+        self.assertEqual(sentiment["broken_ratio"], 0.1474)
+        self.assertEqual(sentiment["previous_limit_premium_mean_pct"], 0.65)
+        self.assertEqual(sentiment["previous_limit_premium_median_pct"], 0.42)
+        self.assertEqual(len(evidence["index_trend"]), 5)
+        self.assertEqual(
+            {item["name"] for item in evidence["index_trend"]},
+            {"上证指数", "深证成指", "创业板指", "科创50", "沪深300"},
+        )
+        self.assertLessEqual(
+            sum(item["classification"] in {"confirmed_mainline", "mainline_candidate"} for item in evidence["theme_candidates"]),
+            3,
+        )
+        themes = {item["theme"]: item for item in evidence["theme_candidates"]}
+        self.assertIn("CPO", themes)
+        self.assertIn("PCB", themes)
+        self.assertIn("半导体", themes)
+        self.assertNotEqual(themes["消费链"]["classification"], "confirmed_mainline")
+        leader = next(item for item in evidence["stock_candidates"] if item["name"] == "爱丽家居")
+        self.assertEqual(leader["trade_eligibility"], "observation_only")
+        self.assertEqual(leader["position_cap_pct"], 0)
+        self.assertEqual(evidence["external_tech_context"]["status"], "ok")
+
+    def test_external_tech_context_requires_timestamp_for_each_required_index(self) -> None:
+        context = AShareReviewEvidenceService._build_external_tech_context(
+            [
+                {"code": "SPX", "change_pct": -0.5, "as_of": "2026-07-29"},
+                {"code": "IXIC", "change_pct": -2.1, "as_of": "2026-07-29"},
+                {"code": "SOX", "change_pct": -4.5},
+            ]
+        )
+
+        self.assertEqual(context.status, "partial")
+        self.assertEqual(context.as_of, "2026-07-29")
+
+    def test_liquid_first_board_does_not_replace_tradeable_front_row(self) -> None:
+        candidates = AShareReviewEvidenceService._build_theme_candidates(
+            {
+                "active_themes": [
+                    {"name": "测试题材", "source": "sector", "rank": 1, "change_pct": 5.0, "strength_score": 90}
+                ],
+                "lagging_themes": [],
+            },
+            [
+                {
+                    "code": "600001",
+                    "name": "一字高标",
+                    "industry": "测试题材",
+                    "amount": 1_000_000_000,
+                    "turnover_rate": 0.2,
+                    "consecutive_boards": 4,
+                    "first_limit_time": "092500",
+                    "break_count": 0,
+                },
+                {
+                    "code": "600002",
+                    "name": "容量首板",
+                    "industry": "测试题材",
+                    "amount": 8_000_000_000,
+                    "turnover_rate": 8.0,
+                    "consecutive_boards": 1,
+                    "first_limit_time": "100000",
+                    "break_count": 0,
+                },
+            ],
+        )
+
+        theme = candidates[0]
+        self.assertTrue(theme.capacity_core_present)
+        self.assertFalse(theme.tradeable_front_present)
+        self.assertNotIn(theme.classification, {"confirmed_mainline", "mainline_candidate"})
+
+    def test_index_history_is_requested_for_all_targets_without_runtime_snapshot(self) -> None:
+        manager = MagicMock()
+        manager.get_index_daily_history.side_effect = lambda symbol, days=30: _bars(100.0)
+        rows, _, _ = AShareReviewEvidenceService(manager)._build_index_trend(
+            [],
+            trade_date="20260729",
+        )
+
+        self.assertEqual(manager.get_index_daily_history.call_count, 5)
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(item.current_source == "historical_close_fallback" for item in rows))
+
+    def test_exact_historical_close_beats_runtime_snapshot_without_as_of(self) -> None:
+        manager = MagicMock()
+        manager.get_index_daily_history.side_effect = lambda symbol, days=30: _bars(100.0)
+        rows, _, _ = AShareReviewEvidenceService(manager)._build_index_trend(
+            [{"code": "sh000001", "name": "上证指数", "current": 9999.0, "change_pct": 9.9}],
+            trade_date="20260620",
+        )
+
+        shanghai = next(item for item in rows if item.code == "000001")
+        self.assertEqual(shanghai.current_source, "historical_close_fallback")
+        self.assertEqual(shanghai.status, "ok")
+        self.assertEqual(shanghai.current, 120.0)
 
     def test_marks_missing_sources_without_aborting(self) -> None:
         manager = MagicMock()

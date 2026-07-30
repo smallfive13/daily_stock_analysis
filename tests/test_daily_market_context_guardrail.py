@@ -299,3 +299,27 @@ def test_conservative_market_context_does_not_soften_do_not_buy_in_english() -> 
     assert adjustments == []
     assert result.decision_type == "buy"
     assert result.operation_advice == "Do not buy now; sell into strength."
+
+
+def test_structured_red_risk_state_softens_buy_without_risk_words_in_summary() -> None:
+    result = _result()
+    result.decision_type = "buy"
+    result.operation_advice = "建议买入并逐步加仓。"
+    result.confidence_level = "高"
+
+    adjustments = apply_daily_market_context_guardrail(
+        result,
+        daily_market_context={
+            "region": "cn",
+            "trade_date": "2026-07-29",
+            "summary": "市场热度较高。",
+            "risk_state": "red",
+            "position_cap_pct": 10,
+        },
+        report_language="zh",
+    )
+
+    assert "daily_market_context_buy_softened" in adjustments
+    assert "confidence_capped_daily_market_context" in adjustments
+    assert result.decision_type == "hold"
+    assert result.operation_advice == "观望"

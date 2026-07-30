@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-A_SHARE_REVIEW_EVIDENCE_SCHEMA_VERSION = "a-share-review-evidence-v1"
+A_SHARE_REVIEW_EVIDENCE_SCHEMA_VERSION = "a-share-review-evidence-v2"
 A_SHARE_REVIEW_STATUS = Literal["ok", "partial", "unknown", "not_supported"]
 
 
@@ -16,6 +16,10 @@ class AShareReviewSource(BaseModel):
     dataset: str
     status: str = "unknown"
     message: Optional[str] = None
+    source_role: Literal["canonical", "fallback", "diagnostic"] = "diagnostic"
+    as_of: Optional[str] = None
+    trade_date: Optional[str] = None
+    failure_reason: Optional[str] = None
 
 
 class AShareReviewDataQuality(BaseModel):
@@ -30,6 +34,7 @@ class AShareIndexTrend(BaseModel):
     code: str
     name: str
     current: Optional[float] = None
+    change_pct: Optional[float] = None
     ma5: Optional[float] = None
     ma10: Optional[float] = None
     ma20: Optional[float] = None
@@ -38,6 +43,10 @@ class AShareIndexTrend(BaseModel):
     dist_ma20_pct: Optional[float] = None
     high_20d: Optional[float] = None
     low_20d: Optional[float] = None
+    as_of: Optional[str] = None
+    trade_date: Optional[str] = None
+    status: str = "unknown"
+    current_source: str = "unknown"
 
 
 class AShareSentimentStructure(BaseModel):
@@ -67,6 +76,11 @@ class AShareThemeCandidate(BaseModel):
     limit_up_count: int = 0
     max_board_height: int = 0
     representative_stocks: List[str] = Field(default_factory=list)
+    subthemes: List[str] = Field(default_factory=list)
+    capacity_core_present: bool = False
+    tradeable_front_present: bool = False
+    actionable: bool = False
+    position_cap_pct: int = Field(default=0, ge=0, le=100)
     positive_evidence: List[str] = Field(default_factory=list)
     negative_evidence: List[str] = Field(default_factory=list)
     confirmation: str
@@ -84,7 +98,16 @@ class AShareStockCandidate(BaseModel):
     buy_point_type: str
     validation: str
     invalidation: str
+    role: str = "watchlist"
+    trade_eligibility: Literal["conditional", "observation_only"] = "conditional"
+    observation_reason: str = ""
+    trigger_type: str = "confirmation"
+    trigger_level: Optional[float] = None
+    confirmation_conditions: List[str] = Field(default_factory=list)
+    invalidation_level: Optional[float] = None
+    position_cap_pct: int = Field(default=0, ge=0, le=100)
     risk_tags: List[str] = Field(default_factory=list)
+    price_reference_date: Optional[str] = None
     score: float = 0.0
 
 
@@ -93,6 +116,25 @@ class AShareReviewRiskRule(BaseModel):
     triggered: bool = False
     evidence: str
     action: str
+
+
+class AShareExternalTechContext(BaseModel):
+    as_of: Optional[str] = None
+    nasdaq_change_pct: Optional[float] = None
+    semiconductor_proxy_change_pct: Optional[float] = None
+    key_symbols: List[Dict[str, Any]] = Field(default_factory=list)
+    status: Literal["ok", "partial", "missing"] = "missing"
+    source: str = "global_market_indices"
+
+
+class AShareRiskAssessment(BaseModel):
+    raw_heat_score: int = Field(default=50, ge=0, le=100)
+    raw_heat_label: str = "unknown"
+    risk_state: Literal["red", "yellow", "green"] = "yellow"
+    position_mode: str = "confirmation_trial"
+    position_cap_pct: int = Field(default=30, ge=0, le=100)
+    triggered_gates: List[str] = Field(default_factory=list)
+    gate_evidence: List[str] = Field(default_factory=list)
 
 
 class AShareReviewEvidence(BaseModel):
@@ -104,8 +146,10 @@ class AShareReviewEvidence(BaseModel):
     sentiment_structure: AShareSentimentStructure = Field(default_factory=AShareSentimentStructure)
     theme_candidates: List[AShareThemeCandidate] = Field(default_factory=list)
     stock_candidates: List[AShareStockCandidate] = Field(default_factory=list)
+    external_tech_context: AShareExternalTechContext = Field(default_factory=AShareExternalTechContext)
     risk_rules: List[AShareReviewRiskRule] = Field(default_factory=list)
     risk_tags: List[str] = Field(default_factory=list)
+    risk_assessment: AShareRiskAssessment = Field(default_factory=AShareRiskAssessment)
     data_quality: AShareReviewDataQuality = Field(default_factory=AShareReviewDataQuality)
 
 

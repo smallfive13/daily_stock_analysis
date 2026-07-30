@@ -333,6 +333,8 @@ class YfinanceFetcher(BaseFetcher):
         low = float(today_row['Low'])
         # 振幅 = (最高 - 最低) / 昨收 * 100
         amplitude = ((high - low) / prev_close * 100) if prev_close else 0
+        as_of_value = hist.index[-1]
+        as_of = as_of_value.date().isoformat() if hasattr(as_of_value, "date") else str(as_of_value)[:10]
         return {
             'code': return_code,
             'name': name,
@@ -346,6 +348,7 @@ class YfinanceFetcher(BaseFetcher):
             'volume': float(today_row['Volume']),
             'amount': 0.0,  # Yahoo Finance 不提供准确成交额
             'amplitude': amplitude,
+            'as_of': as_of,
         }
 
     def get_main_indices(self, region: str = "cn") -> Optional[List[Dict[str, Any]]]:

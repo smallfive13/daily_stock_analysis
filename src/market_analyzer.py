@@ -39,14 +39,17 @@ from src.services.a_share_review_evidence import (
     aggregate_limit_up_pool as _aggregate_limit_up_pool,
     compute_index_key_levels as _compute_index_key_levels,
 )
+from src.services.market_review_consistency import ensure_market_review_consistency
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
 
 CN_INDEX_KEY_LEVEL_TARGETS = [
     {"symbol": "000001", "name": "上证指数", "aliases": ("000001", "sh000001", "上证指数")},
+    {"symbol": "399001", "name": "深证成指", "aliases": ("399001", "sz399001", "深证成指")},
     {"symbol": "399006", "name": "创业板指", "aliases": ("399006", "sz399006", "创业板指")},
     {"symbol": "000688", "name": "科创50", "aliases": ("000688", "sh000688", "科创50")},
+    {"symbol": "000300", "name": "沪深300", "aliases": ("000300", "sh000300", "沪深300")},
 ]
 
 
@@ -80,6 +83,8 @@ class MarketIndex:
     volume: float = 0.0          # 成交量（手）
     amount: float = 0.0          # 成交额（元）
     amplitude: float = 0.0       # 振幅(%)
+    as_of: str = ""               # 行情时间/交易日（若数据源提供）
+    provider: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -94,6 +99,8 @@ class MarketIndex:
             'volume': self.volume,
             'amount': self.amount,
             'amplitude': self.amplitude,
+            'as_of': self.as_of,
+            'provider': self.provider,
         }
 
 
@@ -130,6 +137,8 @@ class MarketOverview:
     limit_up_structure: Dict = field(default_factory=dict)
     index_key_levels: List[Dict] = field(default_factory=list)
     a_share_evidence: Dict = field(default_factory=dict)
+    normalized_review_snapshot: Dict = field(default_factory=dict)
+    market_stats_source: str = "market_stats"
 
     def __post_init__(self) -> None:
         if not self.data_date:
@@ -554,7 +563,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                         prev_close=item['prev_close'],
                         volume=item['volume'],
                         amount=item['amount'],
-                        amplitude=item['amplitude']
+                        amplitude=item['amplitude'],
+                        as_of=str(item.get('as_of') or item.get('date') or item.get('trade_date') or ''),
+                        provider=str(item.get('provider') or ''),
                     )
                     indices.append(index)
 
@@ -586,6 +597,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 overview.limit_up_count = stats.get('limit_up_count', 0)
                 overview.limit_down_count = stats.get('limit_down_count', 0)
                 overview.total_amount = stats.get('total_amount', 0.0)
+                overview.market_stats_source = str(stats.get('_provider') or 'market_stats')
 
                 logger.info(
                     "[大盘] %s action=get_market_stats status=success up=%s down=%s flat=%s "
@@ -688,13 +700,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     "flat_count": overview.flat_count,
                     "total_amount": overview.total_amount,
                 },
+                global_indices=overview.global_indices,
             )
-            overview.a_share_evidence = evidence
 
             sentiment = evidence.get("sentiment_structure") if isinstance(evidence, dict) else None
             quality = evidence.get("data_quality") if isinstance(evidence, dict) else None
             missing_fields = quality.get("missing_fields") if isinstance(quality, dict) else []
             if isinstance(sentiment, dict) and "limit_up_pool" not in (missing_fields or []):
+                overview.limit_up_count = int(sentiment.get("limit_up_count") or 0)
                 overview.limit_up_structure = {
                     "total": int(sentiment.get("limit_up_count") or 0),
                     "industry_distribution": list(sentiment.get("industry_distribution") or []),
@@ -704,10 +717,24 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 }
             else:
                 overview.limit_up_structure = {}
+            if isinstance(sentiment, dict) and "limit_down_pool" not in (missing_fields or []):
+                limit_down_count = sentiment.get("limit_down_count")
+                if limit_down_count is not None:
+                    overview.limit_down_count = int(limit_down_count)
 
             index_trend = evidence.get("index_trend") if isinstance(evidence, dict) else None
             if isinstance(index_trend, list):
                 overview.index_key_levels = [dict(item) for item in index_trend if isinstance(item, dict)]
+
+            overview.a_share_evidence = evidence
+            risk_assessment = self._build_a_share_risk_assessment(overview, evidence)
+            evidence["risk_assessment"] = risk_assessment
+            overview.a_share_evidence = evidence
+            overview.normalized_review_snapshot = self._build_normalized_review_snapshot(
+                overview,
+                evidence,
+                risk_assessment,
+            )
 
             logger.info(
                 "[大盘] %s action=get_a_share_review_evidence status=success evidence_status=%s themes=%d stocks=%d",
@@ -724,6 +751,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 exc_info=True,
             )
             overview.a_share_evidence = {}
+            overview.normalized_review_snapshot = {}
 
     def _get_limit_up_structure(self, overview: MarketOverview):
         """获取涨停结构（fail-open）。"""
@@ -766,6 +794,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                         volume=float(item.get('volume', 0) or 0),
                         amount=float(item.get('amount', 0) or 0),
                         amplitude=float(item.get('amplitude', 0) or 0),
+                        as_of=str(item.get('as_of') or item.get('date') or item.get('trade_date') or ''),
+                        provider=str(item.get('provider') or ''),
                     )
                 )
 
@@ -1143,8 +1173,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             payload["limit_up_structure"] = dict(overview.limit_up_structure or {})
             payload["index_key_levels"] = list(overview.index_key_levels or [])
             payload["a_share_evidence"] = dict(overview.a_share_evidence or {})
+            payload["normalized_review_snapshot"] = dict(overview.normalized_review_snapshot or {})
+            payload["risk_assessment"] = dict(
+                (overview.normalized_review_snapshot or {}).get("risk_assessment") or {}
+            )
 
-        return payload
+        return ensure_market_review_consistency(payload)
 
     def _supports_market_light(self) -> bool:
         return self.region in MARKET_LIGHT_REGIONS
@@ -1296,11 +1330,24 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if not has_stats:
             return ""
         has_limit_structure = bool(getattr(overview, "limit_up_structure", None))
+        evidence = overview.a_share_evidence if isinstance(overview.a_share_evidence, dict) else {}
+        sentiment = evidence.get("sentiment_structure") if isinstance(evidence.get("sentiment_structure"), dict) else {}
+        has_sentiment_quality = any(
+            sentiment.get(key) is not None
+            for key in ("broken_ratio", "previous_limit_premium_median_pct", "one_price_like_ratio")
+        )
         if self._get_review_language() == "en":
             light = self.build_market_light_snapshot(overview)
-            if has_limit_structure:
+            if has_sentiment_quality:
                 continuation_note = (
-                    "- **Sentiment data boundary**: limit-up pool, continuation height, break count, and industry distribution are provided separately when available; previous-limit-up premium, broken-board feedback, and one-tick board ratio remain unavailable."
+                    "- **Canonical sentiment**: date-scoped event pools override approximate overview limit counts; "
+                    f"failed boards {self._format_prompt_metric(sentiment.get('broken_board_count'))}, "
+                    f"failed-board ratio {self._format_prompt_ratio(sentiment.get('broken_ratio'))}, "
+                    f"previous-limit premium median {self._format_prompt_pct(sentiment.get('previous_limit_premium_median_pct'))}."
+                )
+            elif has_limit_structure:
+                continuation_note = (
+                    "- **Sentiment data boundary**: only the date-scoped limit-up pool and continuation structure are available; missing event pools remain unavailable."
                 )
             else:
                 continuation_note = (
@@ -1308,8 +1355,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 )
             return "\n".join(
                 [
-                    f"- **Market Signal**: {light['score']}/100 "
-                    f"({light['temperature_label']}, {light['label']})",
+                    f"- **Market heat**: {light['score']}/100 ({light['temperature_label']})",
+                    f"- **Risk state**: {light['status']} ({light['label']}); position cap {light['position_cap_pct']}%",
                     f"- **Drivers**: {'; '.join(light['reasons'])}",
                     f"- **Guidance**: {light['guidance']}",
                     "",
@@ -1326,16 +1373,24 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         participation = overview.up_count + overview.down_count
         up_ratio = overview.up_count / participation if participation else 0.0
         limit_spread = overview.limit_up_count - overview.limit_down_count
-        if has_limit_structure:
+        if has_sentiment_quality:
             continuation_note = (
-                "- **情绪数据边界**：涨停池、最高连板、炸板次数和行业分布会在涨停结构中单独列示；当前仍未提供昨日涨停溢价、断板反馈和一字板比例。"
+                "- **情绪权威口径**：日期化事件池覆盖概览近似涨跌停；"
+                f"炸板 {self._format_prompt_metric(sentiment.get('broken_board_count'))} 家，"
+                f"炸板率 {self._format_prompt_ratio(sentiment.get('broken_ratio'))}，"
+                f"昨日涨停溢价中位数 {self._format_prompt_pct(sentiment.get('previous_limit_premium_median_pct'))}。"
+            )
+        elif has_limit_structure:
+            continuation_note = (
+                "- **情绪数据边界**：当前仅有日期化涨停池和连板结构；其他缺失事件池按数据质量降级，不作推断。"
             )
         else:
             continuation_note = (
                 "- **情绪数据边界**：当前未提供炸板率、连板高度、昨日涨停溢价、断板反馈和一字板比例；这里只能判断市场热度，不能判断接力质量。"
             )
         lines = [
-            f"- **盘面信号**：{score}/100（{label}，{light['label']}）",
+            f"- **市场热度**：{score}/100（{label}）",
+            f"- **风险状态**：{light['status']}（{light['label']}）；仓位上限 {light['position_cap_pct']}%",
             f"- **信号依据**：{'；'.join(light['reasons'])}",
             f"- **操作建议**：{light['guidance']}",
             "",
@@ -1350,11 +1405,31 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         return "\n".join(lines)
 
     def build_market_light_snapshot(self, overview: MarketOverview) -> Dict[str, Any]:
-        """Build a deterministic market-light snapshot from structured breadth data."""
+        """Build market heat plus a deterministic risk state from one snapshot."""
         scores = self._build_market_light_scores(overview)
         score = int(scores["score"])
         temperature_label = str(scores["temperature_label"])
-        if score >= 60:
+        risk_assessment: Dict[str, Any] = {}
+        if self.region == "cn":
+            risk_assessment = dict(
+                (overview.normalized_review_snapshot or {}).get("risk_assessment")
+                or (overview.a_share_evidence or {}).get("risk_assessment")
+                or {}
+            )
+            if not risk_assessment and overview.a_share_evidence:
+                risk_assessment = self._build_a_share_risk_assessment(
+                    overview,
+                    overview.a_share_evidence,
+                )
+            if risk_assessment:
+                status = str(risk_assessment.get("risk_state") or "yellow")
+            elif score >= 60:
+                status = "green"
+            elif score >= 40:
+                status = "yellow"
+            else:
+                status = "red"
+        elif score >= 60:
             status = "green"
         elif score >= 40:
             status = "yellow"
@@ -1368,21 +1443,21 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "red": "risk-off",
             }
             guidance_map = {
-                "green": "Risk appetite is acceptable, but keep exposure incremental when leadership evidence is incomplete.",
-                "yellow": "Signals are mixed; keep position sizing moderate and wait for confirmation.",
-                "red": "Risk is elevated; prioritize drawdown control and avoid chasing weak rebounds.",
+                "green": "Risk gates passed; add exposure incrementally and keep invalidation levels explicit.",
+                "yellow": "Market heat may be high, but risk gates are incomplete; cap exposure and wait for confirmation.",
+                "red": "A risk veto is active; prioritize drawdown control and avoid new high-beta exposure.",
             }
             reasons = self._build_market_light_reasons_en(overview, score)
         else:
             label_map = {
-                "green": "可进攻",
-                "yellow": "需观察",
-                "red": "偏防守",
+                "green": "风险门槛通过",
+                "yellow": "确认后试错",
+                "red": "防守/不开高风险新仓",
             }
             guidance_map = {
-                "green": "风险偏好尚可，但主线证据不足时先试错，确认后再加仓。",
-                "yellow": "信号分化，控制仓位并等待量价确认。",
-                "red": "风险偏高，优先控制回撤，避免追高弱反弹。",
+                "green": "指数、情绪、容量核心与外围门槛均通过，可按确认信号逐步提高仓位。",
+                "yellow": "市场热度不等于趋势修复，仓位不超过30%，等待指数与主线共同确认。",
+                "red": "风险否决项已触发，仓位不超过10%，不新开高位科技或接力仓。",
             }
             reasons = self._build_market_light_reasons_zh(overview, score)
 
@@ -1397,6 +1472,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             guidance=guidance_map[status],
             dimensions=scores["dimensions"],
             data_quality=str(scores["data_quality"]),
+            market_heat_score=score,
+            raw_heat_score=int(risk_assessment.get("raw_heat_score", score)),
+            raw_heat_label=str(risk_assessment.get("raw_heat_label", temperature_label)),
+            risk_state=status,
+            position_mode=str(risk_assessment.get("position_mode") or (
+                "incremental_attack" if status == "green" else "confirmation_trial" if status == "yellow" else "defense_only"
+            )),
+            position_cap_pct=int(risk_assessment.get("position_cap_pct") or (60 if status == "green" else 30 if status == "yellow" else 10)),
+            triggered_gates=list(risk_assessment.get("triggered_gates") or []),
+            gate_evidence=list(risk_assessment.get("gate_evidence") or []),
         )
         return snapshot.model_dump()
 
@@ -1411,10 +1496,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 reasons.append(f"上涨家数占比 {up_ratio:.0%}，亏钱效应较强")
             else:
                 reasons.append(f"上涨家数占比 {up_ratio:.0%}，市场分化")
-        index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct is not None]
-        if index_changes:
+        index_changes = self._canonical_index_changes(overview)
+        if index_changes and (self.region != "cn" or len(index_changes) >= 5):
             avg_change = sum(index_changes) / len(index_changes)
             reasons.append(f"主要指数平均涨跌幅 {avg_change:+.2f}%")
+        elif self.region == "cn" and index_changes:
+            reasons.append(f"主要指数仅覆盖 {len(index_changes)}/5，不计算平均涨跌幅")
         if overview.limit_up_count or overview.limit_down_count:
             reasons.append(f"涨跌停差 {overview.limit_up_count - overview.limit_down_count:+d}")
         if not reasons and overview.total_amount:
@@ -1434,10 +1521,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 reasons.append(f"advancers ratio {up_ratio:.0%}, downside pressure dominates")
             else:
                 reasons.append(f"advancers ratio {up_ratio:.0%}, breadth is mixed")
-        index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct is not None]
-        if index_changes:
+        index_changes = self._canonical_index_changes(overview)
+        if index_changes and (self.region != "cn" or len(index_changes) >= 5):
             avg_change = sum(index_changes) / len(index_changes)
             reasons.append(f"average major-index change {avg_change:+.2f}%")
+        elif self.region == "cn" and index_changes:
+            reasons.append(f"major-index coverage {len(index_changes)}/5; average not calculated")
         if overview.limit_up_count or overview.limit_down_count:
             reasons.append(f"limit-up/down spread {overview.limit_up_count - overview.limit_down_count:+d}")
         if not reasons and overview.total_amount:
@@ -1693,8 +1782,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if breadth_available:
             breadth_score = int(overview.up_count / participants * 100)
 
-        index_changes = [idx.change_pct for idx in overview.indices if idx.change_pct is not None]
-        index_available = bool(overview.indices and index_changes)
+        index_changes = self._canonical_index_changes(overview)
+        minimum_index_coverage = 5 if self.region == "cn" else 1
+        index_available = len(index_changes) >= minimum_index_coverage
         index_score = 50
         if index_available:
             avg_change = sum(index_changes) / len(index_changes)
@@ -1743,6 +1833,203 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "temperature_label": label,
             "dimensions": dimensions,
             "data_quality": data_quality,
+        }
+
+    def _canonical_index_changes(self, overview: MarketOverview) -> List[float]:
+        if self.region == "cn":
+            evidence = overview.a_share_evidence if isinstance(overview.a_share_evidence, dict) else {}
+            trend = evidence.get("index_trend") if isinstance(evidence, dict) else None
+            if isinstance(trend, list):
+                values = []
+                for item in trend:
+                    if not isinstance(item, dict) or item.get("change_pct") is None:
+                        continue
+                    try:
+                        values.append(float(item["change_pct"]))
+                    except (TypeError, ValueError):
+                        continue
+                if values:
+                    return values
+        return [float(idx.change_pct) for idx in overview.indices if idx.change_pct is not None]
+
+    def _build_a_share_risk_assessment(
+        self,
+        overview: MarketOverview,
+        evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply deterministic risk ceilings independently from market heat."""
+
+        scores = self._build_market_light_scores(overview)
+        rules = [item for item in (evidence.get("risk_rules") or []) if isinstance(item, dict)]
+        rule_map = {str(item.get("code") or ""): item for item in rules}
+        triggered_gates = [
+            code for code, item in rule_map.items() if code and bool(item.get("triggered"))
+        ]
+        gate_evidence = [
+            str(rule_map[code].get("evidence") or code)
+            for code in triggered_gates
+        ]
+
+        def trigger(code: str, message: str) -> None:
+            if code not in triggered_gates:
+                triggered_gates.append(code)
+                gate_evidence.append(message)
+
+        quality = evidence.get("data_quality") if isinstance(evidence.get("data_quality"), dict) else {}
+        quality_status = str(quality.get("status") or evidence.get("status") or "unknown")
+        index_trend = [item for item in (evidence.get("index_trend") or []) if isinstance(item, dict)]
+        fully_covered_indices = [
+            item
+            for item in index_trend
+            if item.get("status") == "ok"
+            and all(item.get(key) is not None for key in ("current", "ma5", "ma10", "ma20"))
+        ]
+        if quality_status != "ok":
+            trigger("critical_data_not_ok", f"关键数据质量为 {quality_status}")
+        if len(fully_covered_indices) < 5:
+            trigger("incomplete_major_index_coverage", f"五个主要指数仅覆盖 {len(fully_covered_indices)} 个")
+
+        sentiment = evidence.get("sentiment_structure") if isinstance(evidence.get("sentiment_structure"), dict) else {}
+        sentiment_complete = all(
+            sentiment.get(key) is not None
+            for key in ("broken_ratio", "previous_limit_premium_median_pct", "limit_down_count")
+        )
+        if not sentiment_complete:
+            trigger("sentiment_quality_incomplete", "炸板率、昨日涨停溢价或跌停池覆盖不完整")
+
+        themes = [item for item in (evidence.get("theme_candidates") or []) if isinstance(item, dict)]
+        has_capacity_mainline = any(
+            item.get("classification") in {"confirmed_mainline", "mainline_candidate"}
+            and bool(item.get("capacity_core_present"))
+            and bool(item.get("tradeable_front_present"))
+            for item in themes
+        )
+        if not has_capacity_mainline:
+            trigger("capacity_core_confirmation_missing", "可操作方向缺少容量核心与可交易前排的共同确认")
+
+        external = evidence.get("external_tech_context") if isinstance(evidence.get("external_tech_context"), dict) else {}
+        external_ok = external.get("status") == "ok"
+        if not external_ok:
+            trigger("external_tech_context_incomplete", "外围科技数据缺失或覆盖不完整")
+
+        growth_weak = "growth_index_below_short_ma" in triggered_gates
+        external_negative = "external_tech_negative" in triggered_gates
+        external_veto = growth_weak and external_negative
+        if external_veto:
+            trigger(
+                "external_tech_veto",
+                "外围科技显著负反馈且创业板/科创50仍在MA5或MA10下方",
+            )
+
+        index_pass = len(fully_covered_indices) == 5 and all(
+            item.get("dist_ma5_pct") is not None
+            and item.get("dist_ma10_pct") is not None
+            and item["dist_ma5_pct"] >= 0
+            and item["dist_ma10_pct"] >= 0
+            for item in fully_covered_indices
+        )
+        breadth_pass = bool(scores["dimensions"]["breadth"]["available"])
+        sentiment_pass = sentiment_complete and not any(
+            code in triggered_gates
+            for code in ("high_broken_board_ratio", "negative_previous_limit_premium")
+        )
+        all_green_gates_pass = (
+            quality_status == "ok"
+            and index_pass
+            and breadth_pass
+            and sentiment_pass
+            and has_capacity_mainline
+            and external_ok
+            and not external_negative
+        )
+
+        raw_heat_score = int(scores["score"])
+        if all_green_gates_pass:
+            risk_state = "green"
+        elif external_veto or raw_heat_score < 35 or (
+            growth_weak
+            and any(
+                code in triggered_gates
+                for code in ("high_broken_board_ratio", "negative_previous_limit_premium")
+            )
+        ):
+            risk_state = "red"
+        else:
+            risk_state = "yellow"
+
+        position_policy = {
+            "green": ("incremental_attack", 60),
+            "yellow": ("confirmation_trial", 30),
+            "red": ("defense_only", 10),
+        }
+        position_mode, position_cap_pct = position_policy[risk_state]
+        return {
+            "raw_heat_score": raw_heat_score,
+            "raw_heat_label": str(scores["temperature_label"]),
+            "risk_state": risk_state,
+            "position_mode": position_mode,
+            "position_cap_pct": position_cap_pct,
+            "triggered_gates": triggered_gates,
+            "gate_evidence": gate_evidence,
+        }
+
+    def _build_normalized_review_snapshot(
+        self,
+        overview: MarketOverview,
+        evidence: Dict[str, Any],
+        risk_assessment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        sentiment = dict(evidence.get("sentiment_structure") or {})
+        quality = dict(evidence.get("data_quality") or {})
+        data_date = overview.data_date or overview.date
+        return {
+            "version": "a-share-market-review-snapshot-v1",
+            "trade_date": data_date,
+            "generated_at": overview.generated_at,
+            "session_phase": "completed_session",
+            "indices": list(evidence.get("index_trend") or []),
+            "breadth": {
+                "up_count": overview.up_count,
+                "down_count": overview.down_count,
+                "flat_count": overview.flat_count,
+                "canonical_source": overview.market_stats_source,
+                "fallback_source": None,
+                "as_of": data_date,
+                "trade_date": data_date,
+                "status": "ok" if overview.up_count + overview.down_count + overview.flat_count > 0 else "unknown",
+                "failure_reason": None,
+            },
+            "turnover": {
+                "total_amount": overview.total_amount,
+                "market_scope": "沪深口径",
+                "canonical_source": overview.market_stats_source,
+                "fallback_source": None,
+                "as_of": data_date,
+                "trade_date": data_date,
+                "status": "ok" if overview.total_amount > 0 else "unknown",
+                "failure_reason": None,
+            },
+            "sentiment": sentiment,
+            "external_context": dict(evidence.get("external_tech_context") or {}),
+            "theme_evidence": {
+                "candidates": list(evidence.get("theme_candidates") or []),
+                "actionable_directions": [
+                    item
+                    for item in (evidence.get("theme_candidates") or [])
+                    if isinstance(item, dict) and bool(item.get("actionable"))
+                ][:3],
+            },
+            "stock_candidates": list(evidence.get("stock_candidates") or []),
+            "risk_assessment": dict(risk_assessment),
+            "data_quality": quality,
+            "field_sources": {
+                "indices": "a_share_evidence.index_trend",
+                "breadth": overview.market_stats_source,
+                "turnover": overview.market_stats_source,
+                "sentiment": "a_share_evidence.sentiment_structure",
+                "external_context": "a_share_evidence.external_tech_context",
+                "themes": "a_share_evidence.theme_candidates",
+            },
         }
 
     def _build_market_temperature(self, overview: MarketOverview) -> tuple[int, str]:
@@ -1902,16 +2189,26 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         if self.region != "cn" or not isinstance(evidence, dict) or not evidence:
             return ""
 
-        sentiment = evidence.get("sentiment_structure") or {}
+        normalized = overview.normalized_review_snapshot if isinstance(overview.normalized_review_snapshot, dict) else {}
+        sentiment = normalized.get("sentiment") or evidence.get("sentiment_structure") or {}
         themes = [item for item in (evidence.get("theme_candidates") or []) if isinstance(item, dict)][:6]
         stocks = [item for item in (evidence.get("stock_candidates") or []) if isinstance(item, dict)][:10]
         risk_rules = [item for item in (evidence.get("risk_rules") or []) if isinstance(item, dict)]
         quality = evidence.get("data_quality") or {}
+        risk_assessment = normalized.get("risk_assessment") or evidence.get("risk_assessment") or {}
+        external = normalized.get("external_context") or evidence.get("external_tech_context") or {}
 
         if self._get_review_language() == "en":
             lines = [
                 "## A-share Sentiment and Theme Evidence",
                 f"- Evidence status: {self._prompt_cell(evidence.get('status') or 'unknown')}",
+                (
+                    f"- Deterministic market heat: {risk_assessment.get('raw_heat_score', 'N/A')}/100 "
+                    f"({self._prompt_cell(risk_assessment.get('raw_heat_label'))}); risk state: "
+                    f"{self._prompt_cell(risk_assessment.get('risk_state'))}; position cap: "
+                    f"{self._format_prompt_metric(risk_assessment.get('position_cap_pct'))}%. "
+                    "The risk state and cap are authoritative and must not be upgraded."
+                ),
                 (
                     "- Sentiment: limit-up {limit_up}; failed boards {broken}; failed-board ratio {ratio}; "
                     "limit-down {limit_down}; highest board {height}; previous-limit premium median {premium}; "
@@ -1933,6 +2230,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     f"  - {self._prompt_cell(item.get('code'))}: {self._prompt_cell(item.get('evidence'))}; {self._prompt_cell(item.get('action'))}"
                     for item in triggered
                 )
+            lines.append(
+                "- External tech context: status={status}; Nasdaq={nasdaq}; semiconductor proxy={semi}; as-of={as_of}.".format(
+                    status=self._prompt_cell(external.get("status")),
+                    nasdaq=self._format_prompt_pct(external.get("nasdaq_change_pct")),
+                    semi=self._format_prompt_pct(external.get("semiconductor_proxy_change_pct")),
+                    as_of=self._prompt_cell(external.get("as_of")),
+                )
+            )
             if themes:
                 lines.extend([
                     "### Ranked Theme Candidates",
@@ -1963,6 +2268,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "## A股情绪与题材证据",
                 f"- 证据状态: {self._prompt_cell(evidence.get('status') or 'unknown')}",
                 (
+                    f"- 确定性市场热度: {risk_assessment.get('raw_heat_score', 'N/A')}/100"
+                    f"（{self._prompt_cell(risk_assessment.get('raw_heat_label'))}）；风险状态: "
+                    f"{self._prompt_cell(risk_assessment.get('risk_state'))}；仓位上限: "
+                    f"{self._format_prompt_metric(risk_assessment.get('position_cap_pct'))}%。"
+                    "风险状态和仓位上限为系统硬约束，不得升级。"
+                ),
+                (
                     "- 情绪结构: 涨停 {limit_up} 家；炸板 {broken} 家；炸板率 {ratio}；跌停 {limit_down} 家；"
                     "最高 {height} 板；昨日涨停溢价中位数 {premium}；疑似一字/无换手占比 {one_price}。"
                 ).format(
@@ -1982,6 +2294,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     f"  - {self._prompt_cell(item.get('code'))}: {self._prompt_cell(item.get('evidence'))}；{self._prompt_cell(item.get('action'))}"
                     for item in triggered
                 )
+            lines.append(
+                "- 外围科技: 状态={status}；纳指={nasdaq}；半导体代理={semi}；时间={as_of}。".format(
+                    status=self._prompt_cell(external.get("status")),
+                    nasdaq=self._format_prompt_pct(external.get("nasdaq_change_pct")),
+                    semi=self._format_prompt_pct(external.get("semiconductor_proxy_change_pct")),
+                    as_of=self._prompt_cell(external.get("as_of")),
+                )
+            )
             if themes:
                 lines.extend([
                     "### 题材候选排序",
@@ -2048,14 +2368,19 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
     def _format_stock_candidate_prompt_row(self, item: Dict[str, Any]) -> str:
         themes = item.get("themes") or []
         risk_tags = item.get("risk_tags") or []
+        confirmation_conditions = item.get("confirmation_conditions") or []
         return "| {category} | {code} | {name} | {themes} | {buy_point} | {validation} | {invalidation} | {risk_tags} |".format(
-            category=self._prompt_cell(item.get("category")),
+            category=self._prompt_cell(
+                f"{item.get('role') or item.get('category')} / {item.get('trade_eligibility') or 'conditional'}"
+            ),
             code=self._prompt_cell(item.get("code")),
             name=self._prompt_cell(item.get("name")),
             themes=self._prompt_cell("、".join(str(value) for value in themes)),
-            buy_point=self._prompt_cell(item.get("buy_point_type")),
-            validation=self._prompt_cell(item.get("validation")),
-            invalidation=self._prompt_cell(item.get("invalidation")),
+            buy_point=self._prompt_cell(
+                f"{item.get('trigger_type') or item.get('buy_point_type')}；仓位上限{item.get('position_cap_pct', 0)}%"
+            ),
+            validation=self._prompt_cell("；".join(str(value) for value in confirmation_conditions) or item.get("validation")),
+            invalidation=self._prompt_cell(item.get("invalidation_level") or item.get("invalidation")),
             risk_tags=self._prompt_cell("、".join(str(value) for value in risk_tags)),
         )
 
@@ -2100,26 +2425,29 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 return """### 1. Data Scope
 (State generated time, effective trading/data date, and whether the report was generated on a non-trading or after-hours date.)
 
-### 2. Market Summary
-(Summarize tone, breadth, and whether the report is only a snapshot or can support a next-session plan.)
+### 2. Market Heat and Risk State
+(State market heat and the deterministic risk state separately. The risk state and position cap are authoritative.)
 
-### 3. Index Risk Gates
-(Discuss index strength/weakness using provided key levels when available; explicitly say if MA5/MA10/MA20 or support/resistance data is unavailable.)
+### 3. Index, Legacy Main-Line, and External Risk
+(Discuss all five A-share indices with MA5/MA10/MA20, legacy technology branches separately, and external technology risk.)
 
-### 4. Sentiment Temperature
-(Use turnover, breadth, limit-up/down counts, and the limit-up structure when provided. If board-failure rate, continuation height, previous-limit-up premium, broken-board feedback, or one-tick board ratio is absent, explicitly state the limitation.)
+### 4. What Not to Buy
+(List prohibited setups before any theme or entry discussion, including observation-only or externally vetoed setups.)
 
-### 5. Theme Ranking
-(Classify sectors/themes as main-line candidates, diffusion, laggards, or unconfirmed one-day rotation. Cross-check gain/loss rankings with fund inflow/outflow leaders; if a sector rises while showing fund outflow, flag questionable persistence. When global context shows a large related move, explain the transmission chain.)
+### 5. Actionable Directions
+(List no more than three confirmed-mainline/mainline-candidate directions. Keep diffusion, rotation, and observation-only directions explicitly downgraded.)
 
-### 6. Core Watchlist
-(If no stock-level leaders are provided, say no verifiable watchlist is available and give only sector-level observation conditions.)
+### 6. Conditions to Upgrade Risk
+(Give measurable index, theme, capacity-core, sentiment, and external confirmation conditions.)
 
-### 7. Next-Session Strategy
-(Start with what not to buy, then list confirmation conditions, entry trigger types, invalidation triggers, and position caps. Invalidation triggers must be anchored to provided observable data such as index key levels, global indices, limit-up structure, or sector fund-flow persistence. Do not use unverifiable wording like "if the market weakens". If main-line evidence is incomplete, use observation/trial positions before raising exposure.)
+### 7. Core Watchlist and Trade Eligibility
+(Separate observation-only thermometers from conditional trade candidates. Include trigger, confirmation, invalidation, and per-name cap. State the A-share T+1 constraint for new entries.)
 
-### 8. Risk Alerts
-(List the main risks to monitor and end with "For reference only, not investment advice.")"""
+### 8. Position Mode and Cap
+(Repeat the deterministic position mode and numeric portfolio cap without upgrading it.)
+
+### 9. Risk Alerts and Unverified Items
+(List the main risks and remaining missing inputs once; end with "For reference only, not investment advice.")"""
 
             sections: List[str] = [
                 """### 1. Data Scope
@@ -2154,26 +2482,29 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return """### 一、数据口径
 （写明生成时间、实际数据交易日、是否非交易日/盘外复用；明确“今日/明日”的交易日含义）
 
-### 二、盘面总览
-（概括指数、涨跌家数、成交额和情绪温度，先判断当日走势是否由外围事件驱动，明确这是大盘快照还是可执行策略）
+### 二、市场热度与风险状态
+（分开写市场热度和确定性风险状态，明确二者可以背离；风险状态和仓位上限不得升级）
 
-### 三、大盘风险门槛
-（说明上证、沪深300、创业板、科创50强弱；有指数关键位时引用关键位，没有 MA5/MA10/MA20、前高前低和支撑压力数据时必须明确写“暂无精确门槛”，不得编造）
+### 三、指数、旧主线与外围风险
+（逐项说明上证、深证、创业板、科创50、沪深300的 MA5/MA10/MA20；科技必须拆分 CPO、PCB、半导体，并说明外围科技门槛）
 
-### 四、情绪温度
-（解读成交额、涨跌停、市场宽度；结合涨停结构（连板高度、炸板情况）判断情绪强度与亏钱效应；缺少昨日涨停溢价、断板反馈和一字板比例时必须说明，区分“热度”和“接力质量”）
+### 四、不能买什么
+（先列明被风险门槛否决、不可交易或仅作情绪温度计的方向与标的）
 
-### 五、热点排序
-（把行业/概念分为：主线候选、扩散、补涨、伪相关/单日轮动；资金净流入/流出榜与涨跌幅榜交叉验证，涨幅高但资金流出的板块提示持续性存疑；若外围市场数据显示相关行业大幅波动，必须解释与 A 股板块的联动关系，以及谁在打谁、资金从哪来到哪去）
+### 五、可操作方向
+（confirmed_mainline 与 mainline_candidate 合计最多三个；其余明确降级为轮动、防御、扩散或仅观察）
 
-### 六、核心观察票
-（若未提供个股龙头/容量票/趋势核心数据，必须写“暂无可验证观察票”，只能给板块级观察条件，不得编造股票）
+### 六、转为试错或进攻的确认条件
+（给出可验证的指数、情绪、容量核心、前排换手与外围修复条件）
 
-### 七、明日交易计划
-（先写不能买什么，再写确认条件，最后写买点类型、失效位和仓位上限；触发失效条件必须引用已提供的可观察锚点（指数关键位、外围指数、涨停结构或板块资金持续性），禁止使用"若市场走弱"这类不可验证表述；主线未确认时以观察/试错仓为主，只有指数与主线共振确认后再升仓）
+### 七、核心观察票与交易资格
+（区分 observation_only 情绪温度计和 conditional 交易候选；逐票写触发、确认、失效与仓位上限；新开仓提示 A 股 T+1）
 
-### 八、风险提示
-（列出需要关注的风险点；最后补充“建议仅供参考，不构成投资建议”。）"""
+### 八、仓位模式与仓位上限
+（复述系统给出的 position_mode 和数字仓位上限，不得用“轻仓”等模糊词替代）
+
+### 九、风险提示与未验证项
+（数据缺口只在这里简短引用受影响结论，不重复整段免责声明；最后补充“建议仅供参考，不构成投资建议”。）"""
 
         numerals = ["一", "二", "三", "四", "五", "六", "七", "八"]
         section_number = 1
@@ -2863,6 +3194,9 @@ Market conditions can change quickly. The data above is for reference only and d
             report,
             snapshot,
         )
+        report = str(structured_payload.get("markdown_report") or report)
+        if isinstance(structured_payload.get("market_light"), dict):
+            snapshot = dict(structured_payload["market_light"])
 
         logger.info("========== 大盘复盘分析完成 ==========")
 

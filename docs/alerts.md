@@ -365,14 +365,14 @@ scope/type 校验是双向约束：`target_scope=market` 只能使用两类 Mark
 
 ### `MarketLightSnapshot` 契约
 
-结构化快照字段为：`region`、`trade_date`、`status`、`score`、`label`、`temperature_label`、`reasons`、`guidance`、`dimensions`、`data_quality`。`trade_date` 首版固定取 `MarketOverview.date`；P7 不解析 provider quote as-of。
+结构化快照保留原字段 `region`、`trade_date`、`status`、`score`、`label`、`temperature_label`、`reasons`、`guidance`、`dimensions`、`data_quality`，并追加 `market_heat_score`、`raw_heat_score`、`raw_heat_label`、`risk_state`、`position_mode`、`position_cap_pct`、`triggered_gates`、`gate_evidence`。旧历史缺少新增字段时由 schema 默认值兼容读取。
 
-`dimensions` 使用 canonical scorer 单一来源，`build_market_light_snapshot()`、大盘复盘注入块和告警 service 不重复实现 scoring。`_build_market_temperature()` 只是 thin wrapper；红绿灯 `status` 阈值保持 `60/40`，temperature label 阈值保持 `70/55/40`。
+`dimensions` 使用 canonical scorer 单一来源，`build_market_light_snapshot()`、大盘复盘注入块和告警 service 不重复实现 scoring。`_build_market_temperature()` 只是 thin wrapper；temperature label 阈值仍为 `70/55/40`。非 A 股 `status` 继续按热度 `60/40` 映射；A 股 `status` 与 `risk_state` 相同，由五指数均线、情绪质量、容量核心/可交易前排和外围科技硬门槛决定，不能由高热度直接升级。
 
 | dimension | `available=true` 条件 | fallback score |
 | --- | --- | --- |
 | `breadth` | `has_market_stats && (up_count + down_count) > 0` | `50` |
-| `index` | `indices` 非空且至少一个 `change_pct != None` | `50` |
+| `index` | A 股五个主要指数均有 `change_pct`；其他市场至少一个主要指数有值 | `50` |
 | `limit` | `has_market_stats && (limit_up_count + limit_down_count) > 0` | `50` |
 
 `data_quality=unavailable` 表示 `index.available=false`，两类 market rule 都返回 `skipped` 且不触发通知；`partial` 表示至少一个维度 fallback，`ok` 表示三项均 available。`market_light_status` 在 `ok/partial` 下可触发；`partial` 触发时 diagnostics 必含 `missing_dimensions`。`market_light_score_drop` 直接比较 canonical aggregate score；任一侧 `partial` 仍允许比较，但 diagnostics 必含 `partial_comparison=true` 和 `missing_dimensions`。

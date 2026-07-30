@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -901,6 +902,157 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
                     os.environ.pop("DATABASE_PATH", None)
                 else:
                     os.environ["DATABASE_PATH"] = old_db_path
+
+
+    def _build_20260729_conflicting_payload(self) -> tuple[dict, dict]:
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "a_share_review_20260729.json").read_text(encoding="utf-8")
+        )
+        indices = [
+            {
+                "code": item["symbol"],
+                "name": item["name"],
+                "current": item["current"],
+                "change_pct": item["change_pct"],
+                "ma5": item["current"] + 4,
+                "ma10": item["current"] + 6,
+                "ma20": item["current"] + 8,
+                "current_source": "runtime_snapshot",
+            }
+            for item in fixture["indices"]
+        ]
+        themes = [
+            {
+                "theme": "CPO",
+                "classification": "mainline_candidate",
+                "actionable": True,
+                "change_pct": 3.2,
+                "position_cap_pct": 10,
+                "confirmation": "板块强于沪深300且容量核心不破当日低点",
+                "invalidation": "板块转负或容量核心跌破当日低点",
+            },
+            {"theme": "PCB", "classification": "observation_only", "actionable": False, "change_pct": -3.1},
+            {"theme": "半导体", "classification": "observation_only", "actionable": False, "change_pct": -2.4},
+            {"theme": "消费链", "classification": "rotation_or_defense", "actionable": False, "change_pct": 4.8},
+        ]
+        risk = {
+            "raw_heat_score": 72,
+            "raw_heat_label": "强势",
+            "risk_state": "red",
+            "position_mode": "defense_only",
+            "position_cap_pct": 10,
+            "triggered_gates": ["growth_index_below_short_ma", "external_tech_negative", "external_tech_veto"],
+            "gate_evidence": ["成长指数位于MA5/MA10下方", "外围半导体显著下跌"],
+        }
+        snapshot = {
+            "version": "a-share-market-review-snapshot-v1",
+            "trade_date": fixture["trade_date"],
+            "generated_at": fixture["generated_at"],
+            "indices": indices,
+            "breadth": {**fixture["market_stats"], "limit_up_count": None, "limit_down_count": None},
+            "turnover": {"total_amount": 19300, "market_scope": "沪深口径"},
+            "sentiment": fixture["canonical_sentiment"],
+            "external_context": {
+                "status": "ok",
+                "as_of": "2026-07-29",
+                "nasdaq_change_pct": -2.1,
+                "semiconductor_proxy_change_pct": -4.5,
+            },
+            "theme_evidence": {"candidates": themes, "actionable_directions": themes[:1]},
+            "stock_candidates": [
+                {
+                    "code": "603221",
+                    "name": "爱丽家居",
+                    "role": "emotion_thermometer",
+                    "trade_eligibility": "observation_only",
+                    "trigger_type": "无交易触发",
+                    "confirmation_conditions": ["出现充分换手"],
+                    "invalidation": "情绪高度下降",
+                    "position_cap_pct": 0,
+                }
+            ],
+            "risk_assessment": risk,
+            "data_quality": {"status": "ok", "missing_fields": [], "contaminated_fields": [], "errors": []},
+        }
+        payload = {
+            "version": 1,
+            "kind": "market_review",
+            "region": "cn",
+            "language": "zh",
+            "title": "2026-07-29 A股大盘复盘",
+            "date": fixture["trade_date"],
+            "data_date": fixture["trade_date"],
+            "markdown_report": fixture["legacy_conflicting_report"],
+            "sections": [{"key": "overview", "title": "Overview", "markdown": fixture["legacy_conflicting_report"]}],
+            "normalized_review_snapshot": snapshot,
+            "risk_assessment": risk,
+            "a_share_evidence": {
+                "sentiment_structure": fixture["canonical_sentiment"],
+                "theme_candidates": themes,
+                "stock_candidates": snapshot["stock_candidates"],
+                "data_quality": {"status": "ok", "missing_fields": [], "contaminated_fields": [], "errors": []},
+            },
+            "market_light": {
+                "region": "cn",
+                "trade_date": fixture["trade_date"],
+                "status": "red",
+                "risk_state": "red",
+                "score": 72,
+                "label": "防守/不开高风险新仓",
+                "temperature_label": "强势",
+                "position_cap_pct": 10,
+            },
+        }
+        return payload, fixture
+
+    def test_20260729_consistency_guard_replaces_conflicting_markdown(self) -> None:
+        from src.services.market_review_consistency import ensure_market_review_consistency
+
+        payload, _ = self._build_20260729_conflicting_payload()
+        guarded = ensure_market_review_consistency(payload)
+        markdown = guarded["markdown_report"]
+
+        self.assertEqual(guarded["consistency_validation"]["status"], "fallback")
+        self.assertIn("涨停 81 家、炸板 14 家、跌停 9 家", markdown)
+        self.assertIn("炸板率 14.74%", markdown)
+        self.assertIn("中位数 +0.42%", markdown)
+        self.assertNotIn("涨停83家", markdown)
+        self.assertNotIn("仍未提供昨日涨停溢价", markdown)
+        self.assertNotIn("可进攻", markdown)
+        self.assertIn("风险状态：red", markdown)
+        self.assertIn("组合仓位上限：10%", markdown)
+        self.assertIn("CPO", markdown)
+        self.assertIn("PCB", markdown)
+        self.assertIn("半导体", markdown)
+        self.assertIn("爱丽家居 | observation_only | 无交易触发", markdown)
+        self.assertIn("A股当日新开仓受 T+1 约束", markdown)
+
+    def test_20260729_payload_markdown_and_notification_share_guarded_risk_state(self) -> None:
+        payload, fixture = self._build_20260729_conflicting_payload()
+        notifier = self._make_notifier()
+        market_analyzer = MagicMock()
+        market_analyzer.run_daily_review_with_snapshot.return_value = SimpleNamespace(
+            report=fixture["legacy_conflicting_report"],
+            market_light_snapshot=payload["market_light"],
+            structured_payload=payload,
+        )
+
+        with patch.object(market_review_module, "MarketAnalyzer", return_value=market_analyzer):
+            result = run_market_review(
+                notifier,
+                config=SimpleNamespace(report_language="zh", market_review_region="cn"),
+                send_notification=True,
+                save_report_file=False,
+                persist_history=False,
+                return_structured=True,
+            )
+
+        self.assertIsInstance(result, market_review_module.MarketReviewRunResult)
+        self.assertEqual(result.market_review_payload["risk_assessment"]["risk_state"], "red")
+        self.assertIn("风险状态：red", result.report)
+        notification_markdown = notifier.send.call_args.args[0]
+        self.assertIn("风险状态：red", notification_markdown)
+        self.assertNotIn("可进攻", notification_markdown)
 
 
 if __name__ == "__main__":

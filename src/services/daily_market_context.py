@@ -68,6 +68,8 @@ class DailyMarketContext:
     risk_tags: List[str] = field(default_factory=list)
     source: str = "unknown"
     position_cap: Optional[str] = None
+    position_cap_pct: Optional[int] = None
+    risk_state: Optional[str] = None
     sentiment_structure: Dict[str, Any] = field(default_factory=dict)
     theme_candidates: List[Dict[str, Any]] = field(default_factory=list)
     stock_candidates: List[Dict[str, Any]] = field(default_factory=list)
@@ -86,6 +88,10 @@ class DailyMarketContext:
         }
         if self.position_cap:
             payload["position_cap"] = self.position_cap
+        if self.position_cap_pct is not None:
+            payload["position_cap_pct"] = self.position_cap_pct
+        if self.risk_state:
+            payload["risk_state"] = self.risk_state
         if self.sentiment_structure:
             payload["sentiment_structure"] = dict(self.sentiment_structure)
         if self.theme_candidates:
@@ -620,6 +626,10 @@ class DailyMarketContextService:
         summary = _extract_summary(scoped_payload, fallback_summary)
         if not summary:
             return None
+        normalized_snapshot = scoped_payload.get("normalized_review_snapshot")
+        normalized_snapshot = normalized_snapshot if isinstance(normalized_snapshot, Mapping) else {}
+        risk_assessment = normalized_snapshot.get("risk_assessment")
+        risk_assessment = risk_assessment if isinstance(risk_assessment, Mapping) else {}
         risk_signal_text = _join_text_parts(summary, _extract_market_light_signal_text(scoped_payload))
         risk_tags = _extract_risk_tags(risk_signal_text)
         sentiment_structure, theme_candidates, stock_candidates, evidence_risk_tags = (
@@ -630,7 +640,16 @@ class DailyMarketContextService:
             + evidence_risk_tags
             + _map_a_share_risk_tags_to_guardrails(evidence_risk_tags)
         )
-        position_cap = _extract_position_cap(risk_signal_text)
+        risk_state = str(risk_assessment.get("risk_state") or "").strip() or None
+        try:
+            position_cap_pct = int(risk_assessment.get("position_cap_pct"))
+        except (TypeError, ValueError):
+            position_cap_pct = None
+        if risk_state in {"red", "yellow"}:
+            risk_tags.append("high_risk" if risk_state == "red" else "conservative")
+        risk_tags.extend(str(value) for value in (risk_assessment.get("triggered_gates") or []))
+        risk_tags = _dedupe_strings(risk_tags)
+        position_cap = f"{position_cap_pct}%" if position_cap_pct is not None else _extract_position_cap(risk_signal_text)
         full_report = _extract_full_market_report(
             scoped_payload=scoped_payload,
             fallback_full_report=fallback_full_report,
@@ -642,6 +661,8 @@ class DailyMarketContextService:
             risk_tags=risk_tags,
             source=source,
             position_cap=position_cap,
+            position_cap_pct=position_cap_pct,
+            risk_state=risk_state,
             sentiment_structure=sentiment_structure,
             theme_candidates=theme_candidates,
             stock_candidates=stock_candidates,
@@ -655,11 +676,13 @@ class DailyMarketContextService:
 def _extract_a_share_review_context(
     payload: Mapping[str, Any],
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    normalized = payload.get("normalized_review_snapshot")
+    normalized = normalized if isinstance(normalized, Mapping) else {}
     evidence = payload.get("a_share_evidence")
     if not isinstance(evidence, Mapping):
-        return {}, [], [], []
+        evidence = {}
 
-    raw_sentiment = evidence.get("sentiment_structure")
+    raw_sentiment = normalized.get("sentiment") or evidence.get("sentiment_structure")
     sentiment: Dict[str, Any] = {}
     if isinstance(raw_sentiment, Mapping):
         allowed_sentiment_keys = (
@@ -678,7 +701,9 @@ def _extract_a_share_review_context(
         }
 
     themes: List[Dict[str, Any]] = []
-    for item in evidence.get("theme_candidates") or []:
+    theme_evidence = normalized.get("theme_evidence")
+    normalized_themes = theme_evidence.get("candidates") if isinstance(theme_evidence, Mapping) else None
+    for item in normalized_themes or evidence.get("theme_candidates") or []:
         if not isinstance(item, Mapping):
             continue
         theme = _clean_context_text(item.get("theme"))
@@ -691,13 +716,15 @@ def _extract_a_share_review_context(
                 "total_score": item.get("total_score"),
                 "confirmation": _clean_context_text(item.get("confirmation")),
                 "invalidation": _clean_context_text(item.get("invalidation")),
+                "actionable": bool(item.get("actionable")),
+                "position_cap_pct": item.get("position_cap_pct"),
             }
         )
         if len(themes) >= 3:
             break
 
     stocks: List[Dict[str, Any]] = []
-    for item in evidence.get("stock_candidates") or []:
+    for item in normalized.get("stock_candidates") or evidence.get("stock_candidates") or []:
         if not isinstance(item, Mapping):
             continue
         code = _clean_context_text(item.get("code"))
@@ -718,12 +745,20 @@ def _extract_a_share_review_context(
                 "themes": stock_themes[:3],
                 "validation": _clean_context_text(item.get("validation")),
                 "invalidation": _clean_context_text(item.get("invalidation")),
+                "role": _clean_context_text(item.get("role")),
+                "trade_eligibility": _clean_context_text(item.get("trade_eligibility")),
+                "position_cap_pct": item.get("position_cap_pct"),
             }
         )
         if len(stocks) >= 5:
             break
 
-    raw_risk_tags = evidence.get("risk_tags")
+    normalized_risk = normalized.get("risk_assessment")
+    raw_risk_tags = (
+        normalized_risk.get("triggered_gates")
+        if isinstance(normalized_risk, Mapping)
+        else evidence.get("risk_tags")
+    )
     risk_tags = [
         _clean_context_text(item)
         for item in raw_risk_tags
@@ -738,6 +773,10 @@ def _map_a_share_risk_tags_to_guardrails(risk_tags: List[str]) -> List[str]:
         "negative_previous_limit_premium": "market_cooling",
         "growth_index_below_short_ma": "conservative",
         "one_price_concentration": "conservative",
+        "critical_data_not_ok": "conservative",
+        "incomplete_major_index_coverage": "conservative",
+        "external_tech_context_incomplete": "conservative",
+        "external_tech_veto": "high_risk",
     }
     return [mapping[tag] for tag in risk_tags if tag in mapping]
 
@@ -868,6 +907,7 @@ def format_daily_market_context_prompt_section(
         if str(item).strip()
     ] if isinstance(payload.get("risk_tags"), list) else []
     position_cap = str(payload.get("position_cap") or "").strip()
+    risk_state = str(payload.get("risk_state") or "").strip()
     source = str(payload.get("source") or "").strip()
     evidence_lines = _format_a_share_prompt_lines(payload, language)
 
@@ -886,6 +926,8 @@ def format_daily_market_context_prompt_section(
         lines.append("- END_UNTRUSTED_MARKET_SUMMARY")
         if risk_tags:
             lines.append(f"- Risk tags: {', '.join(risk_tags)}")
+        if risk_state:
+            lines.append(f"- Deterministic risk state: {risk_state}")
         if position_cap:
             lines.append(f"- Position cap: {position_cap}")
         lines.append("- Guardrail: if this context is conservative or high risk, avoid aggressive buy advice and prefer smaller position sizing or confirmation.")
@@ -907,8 +949,10 @@ def format_daily_market_context_prompt_section(
     lines.append("- END_UNTRUSTED_MARKET_SUMMARY")
     if risk_tags:
         lines.append(f"- 风险标签：{', '.join(risk_tags)}")
+    if risk_state:
+        lines.append(f"- 确定性风险状态：{risk_state}")
     if position_cap:
-        lines.append(f"- 仓位提示：{position_cap}")
+        lines.append(f"- 仓位上限：{position_cap}")
     lines.append("- 约束：若大盘环境偏谨慎、退潮、观望或高风险，避免给出激进买入建议，优先控制仓位并等待确认。")
     if source:
         lines.append(f"- 来源：{source}")

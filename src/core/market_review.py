@@ -30,6 +30,7 @@ from src.services.run_diagnostics import (
     record_notification_run,
 )
 from src.schemas.market_light import MARKET_LIGHT_REGIONS
+from src.services.market_review_consistency import ensure_market_review_consistency
 from src.utils.market_review_region import (
     MARKET_REVIEW_REGION_ORDER,
     normalize_market_review_region_lenient,
@@ -248,6 +249,7 @@ def run_market_review(
                     region=mkt,
                     report=mkt_report,
                 )
+                mkt_report = str(market_review_payloads[mkt].get("markdown_report") or mkt_report or "")
                 if mkt_report:
                     parts.append(f"{review_text[title_key]}\n\n{mkt_report}")
             if parts:
@@ -289,6 +291,9 @@ def run_market_review(
                     report=review_report,
                 )
             }
+            review_report = str(
+                market_review_payloads[run_region].get("markdown_report") or review_report or ""
+            )
         
         if review_report:
             market_review_payload = _build_combined_market_review_payload(
@@ -449,15 +454,15 @@ def _coerce_market_review_payload(
 ) -> Dict[str, Any]:
     payload = getattr(review_result, "structured_payload", None)
     if isinstance(payload, dict) and payload:
-        return payload
-    return {
+        return ensure_market_review_consistency(payload)
+    return ensure_market_review_consistency({
         "version": 1,
         "kind": MARKET_REVIEW_REPORT_TYPE,
         "region": region,
         "title": "",
         "sections": [{"key": "full_review", "title": "Review", "markdown": report or ""}],
         "markdown_report": report or "",
-    }
+    })
 
 
 def _build_combined_market_review_payload(
