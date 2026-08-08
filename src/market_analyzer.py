@@ -1129,6 +1129,11 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "kind": "market_review",
             "region": self.region,
             "language": language,
+            "color_scheme": getattr(
+                getattr(self, "config", None),
+                "market_review_color_scheme",
+                "green_up",
+            ),
             "title": title,
             "generated_at": overview.generated_at or datetime.now().isoformat(),
             "date": overview.date,
@@ -1327,8 +1332,44 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
     def _build_stats_block(self, overview: MarketOverview) -> str:
         """Build market statistics block."""
         has_stats = overview.up_count or overview.down_count or overview.total_amount
-        if not has_stats:
+        has_market_signal = bool(self._supports_market_light() and (overview.indices or has_stats))
+        if not has_stats and not has_market_signal:
             return ""
+        if not has_stats:
+            light = self.build_market_light_snapshot(overview)
+            if self._get_review_language() == "en":
+                if self.region == "cn":
+                    return "\n".join(
+                        [
+                            f"- **Market heat**: {light['score']}/100 ({light['temperature_label']})",
+                            f"- **Risk state**: {light['status']} ({light['label']}); position cap {light['position_cap_pct']}%",
+                            f"- **Drivers**: {'; '.join(light['reasons'])}",
+                            f"- **Guidance**: {light['guidance']}",
+                        ]
+                    )
+                return "\n".join(
+                    [
+                        f"- **Market Signal**: {light['score']}/100 ({light['temperature_label']}, {light['label']})",
+                        f"- **Drivers**: {'; '.join(light['reasons'])}",
+                        f"- **Guidance**: {light['guidance']}",
+                    ]
+                )
+            if self.region == "cn":
+                return "\n".join(
+                    [
+                        f"- **市场热度**：{light['score']}/100（{light['temperature_label']}）",
+                        f"- **风险状态**：{light['status']}（{light['label']}）；仓位上限 {light['position_cap_pct']}%",
+                        f"- **信号依据**：{'；'.join(light['reasons'])}",
+                        f"- **操作建议**：{light['guidance']}",
+                    ]
+                )
+            return "\n".join(
+                [
+                    f"- **盘面信号**：{light['score']}/100（{light['temperature_label']}，{light['label']}）",
+                    f"- **信号依据**：{'；'.join(light['reasons'])}",
+                    f"- **操作建议**：{light['guidance']}",
+                ]
+            )
         has_limit_structure = bool(getattr(overview, "limit_up_structure", None))
         evidence = overview.a_share_evidence if isinstance(overview.a_share_evidence, dict) else {}
         sentiment = evidence.get("sentiment_structure") if isinstance(evidence.get("sentiment_structure"), dict) else {}
@@ -2966,8 +3007,8 @@ Output the report content directly, no extra commentary.
         # 指数行情（简洁格式）
         indices_text = ""
         for idx in overview.indices[:4]:
-            direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
-            indices_text += f"- **{idx.name}**: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+            marker = self._get_index_change_arrow(idx.change_pct)
+            indices_text += f"- **{idx.name}**: {idx.current:.2f} ({marker} {idx.change_pct:+.2f}%)\n"
         
         # 板块信息
         separator = ", " if template_language == "en" else "、"
@@ -2991,28 +3032,12 @@ Output the report content directly, no extra commentary.
             )
             data_gap_section = self._build_data_gap_input_block(overview).replace("## Data Gaps", "### Data Gaps")
             stats_section = ""
-            if self.profile.has_market_stats:
-                sentiment_quality = ""
-                if sentiment:
-                    sentiment_quality = (
-                        "\n- Follow-through quality: failed-board ratio {broken}; previous-limit premium median {premium}; "
-                        "highest board {height}; one-price heuristic {one_price}."
-                    ).format(
-                        broken=self._format_prompt_ratio(sentiment.get("broken_ratio")),
-                        premium=self._format_prompt_pct(sentiment.get("previous_limit_premium_median_pct")),
-                        height=self._format_prompt_metric(sentiment.get("highest_consecutive_board")),
-                        one_price=self._format_prompt_ratio(sentiment.get("one_price_like_ratio")),
-                    )
-                stats_section = f"""
+            if self._supports_market_light() or self.profile.has_market_stats:
+                stats_block = self._build_stats_block(overview)
+                if stats_block:
+                    stats_section = f"""
 ### 3. Breadth & Liquidity
-| Metric | Value |
-|--------|-------|
-| Advancers | {overview.up_count} |
-| Decliners | {overview.down_count} |
-| Limit-up | {overview.limit_up_count} |
-| Limit-down | {overview.limit_down_count} |
-| Turnover ({self._get_turnover_unit_label()}) | {overview.total_amount:.0f} |
-{sentiment_quality or "- Follow-through quality inputs are unavailable; treat the table as market heat only."}
+{stats_block}
 """
             sector_section = ""
             if self.profile.has_sector_rankings and (top_text or bottom_text or top_concept_text or bottom_concept_text):
@@ -3084,13 +3109,26 @@ Market conditions can change quickly. The data above is for reference only and d
             "### 数据口径",
         )
         data_gap_section = self._build_data_gap_input_block(overview).replace("## 数据缺口", "### 数据缺口")
-        dashboard_block = self._build_stats_block(overview) if self.profile.has_market_stats else ""
+        dashboard_block = (
+            self._build_stats_block(overview)
+            if self._supports_market_light() or self.profile.has_market_stats
+            else ""
+        )
         indices_block = self._build_indices_block(overview)
         sector_block = self._build_sector_block(overview) if self.profile.has_sector_rankings else ""
         summary_focus = (
             "指数承接、成交额变化和板块持续性"
             if self.profile.has_market_stats and self.profile.has_sector_rankings
             else "指数承接、消息催化和整体风险状态"
+        )
+        market_summary_block = (
+            dashboard_block
+            if dashboard_block
+            else (
+                "暂无市场宽度数据。"
+                if self.profile.has_market_stats
+                else "- 当前以主要指数与可用新闻线索评估整体风险状态。"
+            )
         )
         sector_section = (
             f"""
@@ -3101,10 +3139,8 @@ Market conditions can change quickly. The data above is for reference only and d
             else ""
         )
         funds_section = (
-            f"""
+            """
 ### 三、资金与情绪
-{dashboard_block or "- 暂无市场宽度数据。"}
-
 - 结合成交额和涨跌家数看，当前更适合等待确认，避免仅凭单一热点追高。
 """
             if self.profile.has_market_stats
@@ -3144,7 +3180,7 @@ Market conditions can change quickly. The data above is for reference only and d
 {data_gap_section}
 
 ### 一、盘面总览
-- 当前复盘先按大盘快照处理，只有指数与热点持续性同时确认后，才升级为可执行进攻策略。
+{market_summary_block}
 
 ### 二、指数结构
 {indices_block or indices_text or "暂无指数数据。"}

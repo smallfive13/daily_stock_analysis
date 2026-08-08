@@ -300,6 +300,32 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class ScreeningRun(Base):
+    """A completed built-in screening run persisted by DSA."""
+
+    __tablename__ = 'screening_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    strategy = Column(String(64), nullable=False, index=True)
+    market = Column(String(16), nullable=False, index=True)
+    snapshot_source = Column(String(64), index=True)
+    snapshot_count = Column(Integer)
+    after_filter_count = Column(Integer)
+    candidate_count = Column(Integer, nullable=False, default=0)
+    llm_ranked = Column(Boolean)
+    daily_enriched = Column(Boolean)
+    source_errors_json = Column(Text)
+    warnings_json = Column(Text)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        Index('ix_screening_run_strategy_created', 'strategy', 'created_at'),
+        Index('ix_screening_run_market_created', 'market', 'created_at'),
+    )
+
+
 class AnalysisHistory(Base):
     """
     分析结果历史记录模型
@@ -697,6 +723,17 @@ class ConversationMessage(Base):
     role = Column(String(20), nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.now, index=True)
+
+
+class ConversationSessionState(Base):
+    """Persisted user selections for an Agent chat session."""
+
+    __tablename__ = 'conversation_session_states'
+
+    session_id = Column(String(100), primary_key=True)
+    selected_skill_ids_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
 
 
 class ConversationSummary(Base):
@@ -2175,6 +2212,174 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             except Exception:
                 return None
 
+    def save_screening_run(self, payload: Dict[str, Any]) -> int:
+        """Persist one completed screening response without blocking screening on DB errors."""
+        run_id = str(payload.get("run_id") or "").strip()
+        if not run_id:
+            return 0
+        normalized_payload = dict(payload)
+        warnings = self._screening_warning_values(normalized_payload)
+        normalized_payload["warnings"] = warnings
+
+        values = {
+            "strategy": str(normalized_payload.get("strategy") or "").strip() or "unknown",
+            "market": str(normalized_payload.get("market") or "").strip() or "cn",
+            "snapshot_source": str(normalized_payload.get("snapshot_source") or "").strip() or None,
+            "snapshot_count": self._optional_int(normalized_payload.get("snapshot_count")),
+            "after_filter_count": self._optional_int(normalized_payload.get("after_filter_count")),
+            "candidate_count": self._optional_int(normalized_payload.get("candidate_count")) or 0,
+            "llm_ranked": self._optional_bool(normalized_payload.get("llm_ranked")),
+            "daily_enriched": self._optional_bool(normalized_payload.get("daily_enriched")),
+            "source_errors_json": self._safe_json_dumps(normalized_payload.get("source_errors") or []),
+            "warnings_json": self._safe_json_dumps(warnings),
+            "result_json": self._safe_json_dumps(normalized_payload),
+        }
+
+        try:
+            def _write(session: Session) -> int:
+                row = session.execute(
+                    select(ScreeningRun).where(ScreeningRun.run_id == run_id)
+                ).scalar_one_or_none()
+                if row is None:
+                    session.add(ScreeningRun(run_id=run_id, **values))
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                return 1
+
+            return self._run_write_transaction(
+                f"save_screening_run[{run_id}]",
+                _write,
+            )
+        except Exception as exc:
+            logger.warning(
+                "选股运行历史写入失败（fail-open）: run_id=%s err=%s",
+                run_id,
+                exc,
+            )
+            return 0
+
+    def list_screening_runs(
+        self,
+        *,
+        limit: int = 20,
+        strategy: Optional[str] = None,
+        market: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List recent screening runs as compact summaries."""
+        normalized_limit = max(0, min(int(limit), 100))
+        if normalized_limit <= 0:
+            return []
+
+        with self.get_session() as session:
+            statement = select(ScreeningRun)
+            if strategy:
+                statement = statement.where(ScreeningRun.strategy == str(strategy).strip())
+            if market:
+                statement = statement.where(ScreeningRun.market == str(market).strip())
+            rows = session.execute(
+                statement.order_by(desc(ScreeningRun.created_at), desc(ScreeningRun.id)).limit(normalized_limit)
+            ).scalars().all()
+            return [self._screening_run_to_dict(row, include_result=False) for row in rows]
+
+    def get_screening_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Load a completed screening run by its stable run id."""
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return None
+        with self.get_session() as session:
+            row = session.execute(
+                select(ScreeningRun).where(ScreeningRun.run_id == normalized_run_id)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return self._screening_run_to_dict(row, include_result=True)
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _optional_bool(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return None
+        return bool(value)
+
+    @staticmethod
+    def _screening_json_list(value: Optional[str]) -> List[Any]:
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, ValueError):
+            return []
+        return decoded if isinstance(decoded, list) else []
+
+    @staticmethod
+    def _screening_text_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            result = []
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    result.append(text)
+            return result
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    @classmethod
+    def _screening_warning_values(cls, payload: Dict[str, Any]) -> List[str]:
+        warnings: List[str] = []
+        seen: set[str] = set()
+        for key in ("warnings", "degradation"):
+            for item in cls._screening_text_list(payload.get(key)):
+                if item in seen:
+                    continue
+                seen.add(item)
+                warnings.append(item)
+        return warnings
+
+    @classmethod
+    def _screening_run_to_dict(
+        cls,
+        row: ScreeningRun,
+        *,
+        include_result: bool,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "run_id": row.run_id,
+            "strategy": row.strategy,
+            "market": row.market,
+            "snapshot_source": row.snapshot_source or "",
+            "snapshot_count": row.snapshot_count,
+            "after_filter_count": row.after_filter_count,
+            "candidate_count": row.candidate_count,
+            "llm_ranked": row.llm_ranked,
+            "daily_enriched": row.daily_enriched,
+            "source_errors": cls._screening_json_list(row.source_errors_json),
+            "warnings": cls._screening_json_list(row.warnings_json),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        if include_result:
+            try:
+                result = json.loads(row.result_json or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            payload["result"] = result if isinstance(result, dict) else {}
+        return payload
+
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
         获取指定股票最近 N 天的新闻情报
@@ -3057,6 +3262,54 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             session.flush()
             return int(msg.id)
 
+    def save_conversation_user_turn(
+        self,
+        session_id: str,
+        content: str,
+        selected_skill_ids: Optional[List[str]] = None,
+    ) -> int:
+        """Persist a user message and an optional session Skill selection atomically."""
+        with self.session_scope() as session:
+            msg = ConversationMessage(
+                session_id=session_id,
+                role="user",
+                content=content,
+            )
+            session.add(msg)
+            session.flush()
+
+            if selected_skill_ids is not None:
+                now = datetime.now()
+                values = {
+                    "session_id": session_id,
+                    "selected_skill_ids_json": json.dumps(selected_skill_ids, ensure_ascii=False),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                stmt = sqlite_insert(ConversationSessionState).values(**values)
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=["session_id"],
+                        set_={
+                            "selected_skill_ids_json": values["selected_skill_ids_json"],
+                            "updated_at": now,
+                        },
+                    )
+                )
+
+            return int(msg.id)
+
+    def get_conversation_session_selected_skill_ids(
+        self,
+        session_id: str,
+    ) -> Optional[List[str]]:
+        """Return the saved Skill selection, or None when the session has no state row."""
+        with self.session_scope() as session:
+            state = session.get(ConversationSessionState, session_id)
+            if state is None:
+                return None
+            return json.loads(state.selected_skill_ids_json)
+
     def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         获取 Agent 对话历史
@@ -3397,6 +3650,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             删除的消息数
         """
         with self.session_scope() as session:
+            session.execute(
+                delete(ConversationSessionState).where(
+                    ConversationSessionState.session_id == session_id
+                )
+            )
             session.execute(
                 delete(AgentProviderTurn).where(
                     AgentProviderTurn.session_id == session_id
