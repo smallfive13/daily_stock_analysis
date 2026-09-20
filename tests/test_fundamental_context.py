@@ -39,6 +39,22 @@ class _DummyBoardFetcher:
 
 
 class TestFundamentalContext(unittest.TestCase):
+    def test_not_supported_builder_uses_existing_fundamental_schema(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+
+        context = manager.build_not_supported_fundamental_context(
+            "sh000016", "index target: fundamental modules skipped"
+        )
+
+        self.assertEqual(context["status"], "not_supported")
+        self.assertTrue(context["coverage"])
+        self.assertTrue(
+            all(status == "not_supported" for status in context["coverage"].values())
+        )
+        self.assertEqual(
+            context["errors"], ["index target: fundamental modules skipped"]
+        )
+
     def test_offshore_market_returns_not_supported_when_adapter_empty(self) -> None:
         """When yfinance adapter has no data, offshore (US/HK) status is not_supported.
 
@@ -76,6 +92,41 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
         self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
         self.assertEqual(ctx.get("belong_boards"), [])
+
+    def test_hk_futu_blocks_preserve_structural_risk_contract(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=0,
+            fundamental_stage_timeout_seconds=2.0,
+            fundamental_fetch_timeout_seconds=1.5,
+            fundamental_retry_max=1,
+        )
+        boards = [{"name": "Technology", "code": "HK.TEST", "type": "INDUSTRY"}]
+        bundle = {
+            "status": "partial",
+            "growth": {},
+            "earnings": {},
+            "capital_flow": {"latest": {"main_in_flow": 10.0}},
+            "belong_boards": boards,
+            "source_chain": [{"provider": "futu", "result": "ok", "duration_ms": 1}],
+            "errors": [],
+        }
+        with patch("src.config.get_config", return_value=cfg), \
+                patch.object(manager, "get_realtime_quote", return_value=None), \
+                patch.object(
+                    manager, "_fetch_offshore_fundamental_bundle",
+                    return_value=(bundle, None, 1, "fundamental_bundle_futu"),
+                ):
+            ctx = manager.get_fundamental_context("HK00700")
+
+        self.assertEqual(ctx["market"], "hk")
+        self.assertEqual(ctx["capital_flow"]["data"]["latest"]["main_in_flow"], 10.0)
+        self.assertEqual(ctx["boards"]["data"]["boards"], boards)
+        self.assertEqual(ctx["coverage"]["capital_flow"], "ok")
+        self.assertEqual(ctx["coverage"]["boards"], "ok")
+        self.assertEqual(ctx["structural_risk"]["status"], "not_supported")
+        self.assertEqual(ctx["coverage"]["structural_risk"], "not_supported")
 
     def test_offshore_market_populates_blocks_when_adapter_has_data(self) -> None:
         """US/HK fundamental context surfaces yfinance bundle into growth/earnings/belong_boards."""
@@ -138,13 +189,15 @@ class TestFundamentalContext(unittest.TestCase):
                 ):
             ctx = manager.get_fundamental_context("AAPL")
         self.assertEqual(ctx["market"], "us")
-        # Offshore status only considers valuation/growth/earnings (capital_flow
-        # etc. are intentionally not_supported); "ok" when all three populate.
+        # Offshore status considers valuation/growth/earnings plus any populated
+        # capital_flow / boards blocks; "ok" when the populated blocks are ok.
         self.assertEqual(ctx["status"], "ok")
         self.assertEqual(ctx["coverage"].get("growth"), "ok")
         self.assertEqual(ctx["coverage"].get("earnings"), "ok")
         self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
-        self.assertEqual(ctx["coverage"].get("boards"), "not_supported")
+        # belong_boards from the bundle surface the boards block (was hard-coded
+        # not_supported before the Futu integration made it data-driven).
+        self.assertEqual(ctx["coverage"].get("boards"), "ok")
         growth_data = ctx["growth"].get("data") or {}
         self.assertEqual(growth_data.get("revenue_yoy"), 16.5)
         self.assertEqual(growth_data.get("roe"), 141.4)

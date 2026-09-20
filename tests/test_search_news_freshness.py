@@ -73,6 +73,18 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         service._providers[0].search = mock_search
         return service, mock_search
 
+    def test_index_news_without_code_keeps_fresh_subject_evidence(self) -> None:
+        today = datetime.now().date().isoformat()
+        service, mock_search = self._create_service_with_mock_provider(
+            response=_response([_result("上证50 最新消息", today)]),
+        )
+
+        response = service.search_stock_news("", "上证50")
+
+        self.assertEqual(mock_search.call_args.args[0], "上证50 最新 新闻 公告 重大事件")
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(response.results[0].title, "上证50 最新消息")
+
     def test_effective_window_uses_profile_and_news_max_age(self) -> None:
         """window = min(profile_days, NEWS_MAX_AGE_DAYS)."""
         service, mock_search = self._create_service_with_mock_provider(
